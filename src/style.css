@@ -19,6 +19,12 @@
   user-select: none;
 }
 
+input,
+textarea {
+  user-select: text;
+  -webkit-user-select: text;
+}
+
 html,
 body,
 #app {
@@ -39,23 +45,32 @@ body,
   flex-direction: column;
   padding-top: env(safe-area-inset-top, 0px);
   padding-bottom: env(safe-area-inset-bottom, 0px);
+  padding-left: env(safe-area-inset-left, 0px);
+  padding-right: env(safe-area-inset-right, 0px);
 }
 
 .td-topbar {
   display: flex;
-  flex-wrap: wrap;
+  flex-wrap: nowrap;
   align-items: center;
   justify-content: space-between;
-  gap: 6px;
-  padding: 6px 8px;
+  gap: 4px;
+  padding: 5px 6px;
   background: var(--card);
   border-bottom: 1px solid var(--border);
+  min-width: 0;
 }
 
 .td-stats {
   display: flex;
-  flex-wrap: wrap;
+  flex-wrap: nowrap;
   align-items: center;
+  gap: 3px;
+  min-width: 0;
+}
+
+.modal-card .td-stats {
+  flex-wrap: wrap;
   gap: 5px;
 }
 
@@ -63,12 +78,13 @@ body,
   background: var(--card-2);
   border: 1px solid var(--border);
   border-radius: 999px;
-  padding: 3px 8px;
-  font-size: 12px;
+  padding: 3px 6px;
+  font-size: 11px;
   font-weight: 800;
   display: inline-flex;
   align-items: center;
-  gap: 4px;
+  gap: 2px;
+  white-space: nowrap;
 }
 
 .stat-pill.gold {
@@ -88,19 +104,33 @@ body,
 
 .td-top-actions {
   display: flex;
+  flex-wrap: nowrap;
   align-items: center;
-  gap: 5px;
+  gap: 3px;
+  flex-shrink: 0;
 }
 
 .mini-btn {
   border: 1px solid var(--border);
   background: var(--card-2);
   color: var(--text);
-  border-radius: 10px;
-  padding: 5px 8px;
-  font-size: 12px;
+  border-radius: 9px;
+  padding: 4px 6px;
+  font-size: 11px;
   font-weight: 800;
   cursor: pointer;
+  white-space: nowrap;
+}
+
+.td-topbar .mini-btn {
+  padding: 4px 5px;
+  font-size: 11px;
+  border-radius: 8px;
+}
+
+.mini-btn:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
 }
 
 .mini-btn.active {
@@ -112,6 +142,49 @@ body,
   border-color: rgba(250, 204, 21, 0.55);
   background: rgba(250, 204, 21, 0.16);
   color: var(--gold);
+}
+
+.hide-xs {
+  display: none;
+}
+
+.hide-sm {
+  display: none;
+}
+
+@media (min-width: 440px) {
+  .td-topbar {
+    padding: 6px 8px;
+    gap: 6px;
+  }
+
+  .td-stats,
+  .td-top-actions {
+    gap: 5px;
+  }
+
+  .stat-pill {
+    padding: 3px 8px;
+    font-size: 12px;
+    gap: 4px;
+  }
+
+  .mini-btn,
+  .td-topbar .mini-btn {
+    padding: 5px 8px;
+    font-size: 12px;
+    border-radius: 10px;
+  }
+
+  .hide-xs {
+    display: inline;
+  }
+}
+
+@media (min-width: 540px) {
+  .hide-sm {
+    display: inline;
+  }
 }
 
 .td-stage-wrap {
@@ -173,9 +246,23 @@ body,
 
 .castle-row {
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
   justify-content: space-between;
-  gap: 6px;
+  gap: 4px 6px;
+}
+
+.castle-towers-count {
+  font-size: 11px;
+  font-weight: 700;
+  color: var(--muted);
+  white-space: nowrap;
+}
+
+.castle-actions {
+  display: flex;
+  align-items: center;
+  gap: 5px;
 }
 
 .inspector-box {
@@ -217,23 +304,31 @@ body,
   gap: 6px;
 }
 
-.spec-btn {
+.spec-btn,
+.spec-card {
   border: 1px solid rgba(168, 85, 247, 0.55);
   background: linear-gradient(155deg, rgba(168, 85, 247, 0.24), rgba(30, 41, 59, 0.9));
   color: var(--text);
   border-radius: 12px;
-  padding: 7px 5px;
+  padding: 8px 5px;
   display: flex;
   flex-direction: column;
   align-items: center;
   text-align: center;
-  gap: 2px;
+  gap: 3px;
   cursor: pointer;
-  font-size: 11px;
+  font-size: 12px;
 }
 
-.spec-btn.poor {
+.spec-btn.poor,
+.spec-card.poor {
   opacity: 0.5;
+}
+
+.spec-card-desc {
+  font-size: 11px;
+  line-height: 1.25;
+  color: var(--muted);
 }
 
 .action-btn {
@@ -274,7 +369,10 @@ body,
   display: flex;
   align-items: center;
   justify-content: center;
-  padding: 16px;
+  padding: calc(16px + env(safe-area-inset-top, 0px))
+    calc(16px + env(safe-area-inset-right, 0px))
+    calc(16px + env(safe-area-inset-bottom, 0px))
+    calc(16px + env(safe-area-inset-left, 0px));
   z-index: 40;
 }
 
@@ -289,6 +387,7 @@ body,
   flex-direction: column;
   gap: 10px;
   max-height: 85vh;
+  max-height: calc(100dvh - 32px - env(safe-area-inset-top, 0px) - env(safe-area-inset-bottom, 0px));
   overflow-y: auto;
 }
 
@@ -300,4 +399,6 @@ body,
   border-radius: 10px;
   padding: 8px 10px;
   font-size: 13px;
+  user-select: text;
+  -webkit-user-select: text;
 }

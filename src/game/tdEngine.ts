@@ -292,7 +292,7 @@ export class CastleTdEngine {
         radius: 0,
         maxRadius: 0,
         color: '#f87171',
-        text: `-${def.cost}g nodig`,
+        text: `Need ${def.cost}g`,
         life: 0.9,
         maxLife: 0.9,
       });

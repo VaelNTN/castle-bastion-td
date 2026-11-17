@@ -28,15 +28,15 @@ export function getDeviceId(): string {
 
 export function getPlayerName(): string {
   try {
-    return localStorage.getItem(KEY_NAME) || 'Kasteelheer';
+    return localStorage.getItem(KEY_NAME) || 'Commander';
   } catch {
-    return 'Kasteelheer';
+    return 'Commander';
   }
 }
 
 export function setPlayerName(name: string): void {
   try {
-    localStorage.setItem(KEY_NAME, name.trim().slice(0, 20) || 'Kasteelheer');
+    localStorage.setItem(KEY_NAME, name.trim().slice(0, 20) || 'Commander');
   } catch {
     // ignore
   }
@@ -112,15 +112,25 @@ export async function submitTdScore(wave: number, kills: number, score: number):
   }
 }
 
-export async function fetchTdHighscores(): Promise<TdHighscoreEntry[]> {
+export type HighscoreStatus = 'ok' | 'no-server' | 'offline';
+
+export interface HighscoreFetchResult {
+  entries: TdHighscoreEntry[];
+  status: HighscoreStatus;
+}
+
+export async function fetchTdHighscores(): Promise<HighscoreFetchResult> {
   const base = getApiUrl();
-  if (!base) return [];
+  if (!base) return { entries: [], status: 'no-server' };
   try {
     const res = await fetch(`${base}/api/castle-bastion/highscores?limit=30&deviceId=${encodeURIComponent(getDeviceId())}`);
-    if (!res.ok) return [];
+    if (!res.ok) return { entries: [], status: 'offline' };
     const data = (await res.json()) as { entries?: TdHighscoreEntry[] };
-    return Array.isArray(data.entries) ? data.entries : [];
+    return {
+      entries: Array.isArray(data.entries) ? data.entries : [],
+      status: 'ok',
+    };
   } catch {
-    return [];
+    return { entries: [], status: 'offline' };
   }
 }
