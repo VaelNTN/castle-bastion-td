@@ -1,0 +1,23 @@
+{
+  "name": "castle-bastion-td",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Castle Bastion TD - Endless Tower Defense with 50+ towers, 100s of monsters, 10 base upgrades + 3 specializations + 10 spec upgrades",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc && vite build",
+    "preview": "vite preview",
+    "cap:sync": "npm run build && npx cap sync android"
+  },
+  "dependencies": {
+    "@capacitor/core": "^8.6.2",
+    "@capacitor/device": "^8.0.3"
+  },
+  "devDependencies": {
+    "@capacitor/android": "^8.6.2",
+    "@capacitor/cli": "^8.6.2",
+    "typescript": "^5.7.3",
+    "vite": "^6.2.0"
+  }
+}
