@@ -1955,6 +1955,83 @@ export class CastleTdEngine {
       ctx.arc(0, 0, 3.2 + Math.sin(this.animTime * 10) * 0.7, 0, Math.PI * 2);
       ctx.fill();
     }
+
+    // Visible miniature crew ("mannetje") operating the tower!
+    if (tower.baseType === 'archer') {
+      // Hooded Ranger/Archer behind the bow
+      ctx.fillStyle = tower.specType === 'venom' ? '#14532d' : '#1e3a8a';
+      ctx.beginPath();
+      ctx.arc(-5, 0, 5.2, 0, Math.PI * 2);
+      ctx.fill();
+      // Quiver on back
+      ctx.fillStyle = '#78350f';
+      ctx.fillRect(-9.5, -3.5, 3, 7);
+      // Hooded head + feather on higher upgrades
+      ctx.fillStyle = '#fde68a';
+      ctx.beginPath();
+      ctx.arc(-3.5, 0, 3.4, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.fillStyle = tower.specType ? stats.color : '#15803d';
+      ctx.beginPath();
+      ctx.arc(-4.2, 0, 3.8, Math.PI * 0.35, Math.PI * 1.65);
+      ctx.fill();
+      if (tier >= 4 || tower.specType) {
+        ctx.fillStyle = '#facc15';
+        ctx.fillRect(-8, -4.5, 4, 1.5);
+      }
+    } else if (tower.baseType === 'cannon') {
+      // Goggled Artillery Engineer behind the cannon carriage
+      ctx.fillStyle = '#475569';
+      ctx.beginPath();
+      ctx.arc(-7.5, 0, 4.8, 0, Math.PI * 2);
+      ctx.fill();
+      // Brass helmet & goggles
+      ctx.fillStyle = tower.specType === 'inferno' ? '#dc2626' : '#f59e0b';
+      ctx.beginPath();
+      ctx.arc(-7, 0, 3.6, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.fillStyle = '#38bdf8';
+      ctx.fillRect(-4.8, -2.5, 1.6, 2);
+      ctx.fillRect(-4.8, 0.5, 1.6, 2);
+    } else if (tower.baseType === 'frost') {
+      // Robed Frost/Chrono Mage standing on plinth beside spire
+      ctx.save();
+      ctx.rotate(-tower.angle);
+      ctx.fillStyle = tower.specType === 'chrono' ? '#4338ca' : '#0284c7';
+      ctx.beginPath();
+      ctx.arc(-7, 7, 4.4, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.fillStyle = '#bae6fd';
+      ctx.beginPath();
+      ctx.arc(-7, 7, 2.7, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.fillStyle = tower.specType === 'chrono' ? '#facc15' : '#e0f2fe';
+      ctx.beginPath();
+      ctx.moveTo(-7, 3);
+      ctx.lineTo(-10, 9);
+      ctx.lineTo(-4, 9);
+      ctx.closePath();
+      ctx.fill();
+      ctx.restore();
+    } else {
+      // Storm/Arcane Wizard operator
+      ctx.fillStyle = tower.specType === 'laser' ? '#be123c' : '#6d28d9';
+      ctx.beginPath();
+      ctx.arc(-6.5, 0, 4.6, 0, Math.PI * 2);
+      ctx.fill();
+      // Pointed wizard hat
+      ctx.fillStyle = stats.accent;
+      ctx.beginPath();
+      ctx.arc(-6, 0, 3.8, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.fillStyle = '#fef08a';
+      ctx.beginPath();
+      ctx.moveTo(-5, -1.5);
+      ctx.lineTo(-11, 0);
+      ctx.lineTo(-5, 1.5);
+      ctx.closePath();
+      ctx.fill();
+    }
     ctx.restore();
 
     // Compact level badge
@@ -1984,11 +2061,25 @@ export class CastleTdEngine {
 
     ctx.translate(0, bob);
 
-    // Boss menacing aura
+    // Boss menacing aura + war banner
     if (m.kind === 'boss') {
       ctx.beginPath();
       ctx.arc(0, 0, m.radius + 5 + Math.sin(this.animTime * 6) * 1.5, 0, Math.PI * 2);
       ctx.fillStyle = 'rgba(192, 38, 211, 0.25)';
+      ctx.fill();
+      // War banner staff on back
+      ctx.strokeStyle = '#fde047';
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      ctx.moveTo(-m.radius * 0.65, 2);
+      ctx.lineTo(-m.radius * 0.65, -m.radius * 1.65);
+      ctx.stroke();
+      ctx.fillStyle = '#dc2626';
+      ctx.beginPath();
+      ctx.moveTo(-m.radius * 0.65, -m.radius * 1.65);
+      ctx.lineTo(-m.radius * 1.3, -m.radius * 1.42 + Math.sin(this.animTime * 8) * 2);
+      ctx.lineTo(-m.radius * 0.65, -m.radius * 1.2);
+      ctx.closePath();
       ctx.fill();
     }
 
@@ -2047,7 +2138,7 @@ export class CastleTdEngine {
       ctx.fill();
     }
 
-    // Goblin ears
+    // Goblin ears + dagger
     if (m.kind === 'goblin') {
       ctx.fillStyle = fill;
       ctx.beginPath();
@@ -2060,17 +2151,26 @@ export class CastleTdEngine {
       ctx.lineTo(m.radius * 1.4, -6);
       ctx.lineTo(m.radius * 0.7, 3);
       ctx.fill();
+      ctx.fillStyle = '#cbd5e1';
+      ctx.fillRect(m.radius * 0.85, -5, 2.2, 6.5);
     }
 
-    // Knight armored shield & helm crest
+    // Knight armored shield (with boss emblem) & sword + helm crest
     if (m.kind === 'knight') {
       ctx.fillStyle = '#475569';
       ctx.beginPath();
-      ctx.roundRect(-m.radius * 0.95, -2, m.radius * 0.65, m.radius * 1.05, 3);
+      ctx.roundRect(-m.radius * 0.98, -3, m.radius * 0.72, m.radius * 1.1, 3);
       ctx.fill();
       ctx.strokeStyle = '#f8fafc';
       ctx.lineWidth = 1.2;
       ctx.stroke();
+      ctx.fillStyle = '#facc15';
+      ctx.beginPath();
+      ctx.arc(-m.radius * 0.62, 2, 1.8, 0, Math.PI * 2);
+      ctx.fill();
+      // Broadsword
+      ctx.fillStyle = '#e2e8f0';
+      ctx.fillRect(m.radius * 0.75, -8, 2.6, 11);
       // Plume
       ctx.fillStyle = '#ef4444';
       ctx.fillRect(-3, -m.radius - 4, 6, 5);
