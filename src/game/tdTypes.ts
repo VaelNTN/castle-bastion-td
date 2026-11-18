@@ -69,6 +69,7 @@ export interface TowerInstance {
   cooldown: number;
   angle: number;
   muzzleFlash: number;
+  recoil: number;
   beamTargetId: number | null;
   beamRamp: number;
 }
@@ -101,9 +102,13 @@ export interface MonsterInstance {
   wobbleOffset: number;
 }
 
+export type ProjectileVisualKind = 'arrow' | 'sniper' | 'venom' | 'cannon' | 'mortar' | 'inferno' | 'cryo';
+
 export interface ProjectileInstance {
   x: number;
   y: number;
+  prevX: number;
+  prevY: number;
   vx: number;
   vy: number;
   targetId: number;
@@ -118,6 +123,7 @@ export interface ProjectileInstance {
   burnDps: number;
   isArrow: boolean;
   isCrit: boolean;
+  kind: ProjectileVisualKind;
   towerId: number;
   life: number;
 }
@@ -126,6 +132,9 @@ export interface VisualEffect {
   kind: 'ring' | 'lightning' | 'text' | 'spark';
   x: number;
   y: number;
+  vx?: number;
+  vy?: number;
+  gravity?: number;
   x2?: number;
   y2?: number;
   points?: { x: number; y: number }[];
@@ -133,6 +142,7 @@ export interface VisualEffect {
   maxRadius: number;
   color: string;
   text?: string;
+  bold?: boolean;
   life: number;
   maxLife: number;
 }

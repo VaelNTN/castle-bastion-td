@@ -3,6 +3,7 @@ import { BASE_TOWERS, SPEC_TOWERS } from './tdCatalog';
 import {
   BUILDABLE_SLOTS_COUNT,
   CASTLE_TILE,
+  getPathNeighbors,
   GRID_COLS,
   GRID_ROWS,
   isPathTile,
@@ -17,6 +18,7 @@ import {
   MonsterInstance,
   MonsterKind,
   ProjectileInstance,
+  ProjectileVisualKind,
   SpecTowerType,
   TargetMode,
   TowerInstance,
@@ -53,9 +55,16 @@ export interface TdUiSnapshot {
   nextWaveCostBonus: number;
 }
 
+function hash2d(c: number, r: number, salt = 0): number {
+  let n = Math.imul(c + 37, 374761393) + Math.imul(r + 17, 668265263) + Math.imul(salt + 11, 2147483647);
+  n = (n ^ (n >>> 13)) * 1274126177;
+  return ((n ^ (n >>> 16)) >>> 0) / 4294967296;
+}
+
 export class CastleTdEngine {
   private canvas: HTMLCanvasElement;
   private ctx: CanvasRenderingContext2D;
+  private terrainCache: HTMLCanvasElement | null = null;
 
   private towers: TowerInstance[] = [];
   private monsters: MonsterInstance[] = [];
@@ -82,11 +91,14 @@ export class CastleTdEngine {
 
   private buildTool: BaseTowerType | null = 'archer';
   private selectedTowerId: number | null = null;
+  private hoverTile: { col: number; row: number } | null = null;
 
   private rafId = 0;
+  private running = false;
   private lastTs = 0;
   private animTime = 0;
   private lastHudPush = 0;
+  private lastGoldPopupAt = 0;
   private onHudUpdate: (snap: TdUiSnapshot) => void;
   private onGameOverCallback?: (wave: number, kills: number, score: number) => void;
 
@@ -94,6 +106,21 @@ export class CastleTdEngine {
   private scale = 1;
   private offsetX = 0;
   private offsetY = 0;
+  private dpr = 1;
+  private cssW = 0;
+  private cssH = 0;
+
+  private boundResize = (): void => {
+    this.syncCanvasMetrics();
+  };
+  private boundOrientation = (): void => {
+    window.setTimeout(() => this.syncCanvasMetrics(), 90);
+  };
+  private boundVisibility = (): void => {
+    if (!document.hidden) {
+      this.lastTs = performance.now();
+    }
+  };
 
   constructor(
     canvas: HTMLCanvasElement,
@@ -108,10 +135,39 @@ export class CastleTdEngine {
     this.onGameOverCallback = onGameOver;
   }
 
+  private syncCanvasMetrics(): void {
+    const rect = this.canvas.getBoundingClientRect();
+    if (rect.width < 2 || rect.height < 2) return;
+    const dpr = Math.min(2, window.devicePixelRatio || 1);
+    const cw = Math.max(1, Math.round(rect.width * dpr));
+    const ch = Math.max(1, Math.round(rect.height * dpr));
+    if (this.canvas.width !== cw || this.canvas.height !== ch) {
+      this.canvas.width = cw;
+      this.canvas.height = ch;
+    }
+    this.dpr = dpr;
+    this.cssW = rect.width;
+    this.cssH = rect.height;
+    this.scale = Math.min(rect.width / WORLD_W, rect.height / WORLD_H);
+    this.offsetX = (rect.width - WORLD_W * this.scale) * 0.5;
+    this.offsetY = (rect.height - WORLD_H * this.scale) * 0.5;
+  }
+
   start(): void {
+    if (this.rafId) {
+      cancelAnimationFrame(this.rafId);
+      this.rafId = 0;
+    }
+    this.running = true;
+    this.syncCanvasMetrics();
+    window.addEventListener('resize', this.boundResize);
+    window.addEventListener('orientationchange', this.boundOrientation);
+    document.addEventListener('visibilitychange', this.boundVisibility);
+
     this.lastTs = performance.now();
     this.pushHud(true);
     const loop = (ts: number): void => {
+      if (!this.running) return;
       const rawDt = Math.min(0.05, Math.max(0.001, (ts - this.lastTs) / 1000));
       this.lastTs = ts;
       this.update(rawDt);
@@ -126,7 +182,15 @@ export class CastleTdEngine {
   }
 
   destroy(): void {
-    cancelAnimationFrame(this.rafId);
+    this.running = false;
+    if (this.rafId) {
+      cancelAnimationFrame(this.rafId);
+      this.rafId = 0;
+    }
+    window.removeEventListener('resize', this.boundResize);
+    window.removeEventListener('orientationchange', this.boundOrientation);
+    document.removeEventListener('visibilitychange', this.boundVisibility);
+    soundFx.clearPending();
   }
 
   resetGame(): void {
@@ -148,6 +212,7 @@ export class CastleTdEngine {
     this.gameOver = false;
     this.selectedTowerId = null;
     this.buildTool = 'archer';
+    this.hoverTile = null;
     this.pushHud(true);
   }
 
@@ -261,14 +326,32 @@ export class CastleTdEngine {
     };
   }
 
-  handleCanvasTap(clientX: number, clientY: number): void {
-    if (this.gameOver) return;
+  private screenToTile(clientX: number, clientY: number): { col: number; row: number } | null {
+    if (!(this.scale > 0 && Number.isFinite(this.scale))) return null;
     const rect = this.canvas.getBoundingClientRect();
+    if (rect.width < 2 || rect.height < 2) return null;
     const wx = (clientX - rect.left - this.offsetX) / this.scale;
     const wy = (clientY - rect.top - this.offsetY) / this.scale;
+    if (!Number.isFinite(wx) || !Number.isFinite(wy)) return null;
     const col = Math.floor(wx / TILE_SIZE);
     const row = Math.floor(wy / TILE_SIZE);
-    if (col < 0 || col >= GRID_COLS || row < 0 || row >= GRID_ROWS) return;
+    if (col < 0 || col >= GRID_COLS || row < 0 || row >= GRID_ROWS) return null;
+    return { col, row };
+  }
+
+  handleCanvasHover(clientX: number, clientY: number): void {
+    this.hoverTile = this.screenToTile(clientX, clientY);
+  }
+
+  clearHover(): void {
+    this.hoverTile = null;
+  }
+
+  handleCanvasTap(clientX: number, clientY: number): void {
+    if (this.gameOver) return;
+    const tile = this.screenToTile(clientX, clientY);
+    if (!tile) return;
+    const { col, row } = tile;
 
     const existing = this.towers.find((t) => t.col === col && t.row === row);
     if (existing) {
@@ -285,7 +368,7 @@ export class CastleTdEngine {
 
     const def = BASE_TOWERS[this.buildTool];
     if (this.gold < def.cost) {
-      this.effects.push({
+      this.pushEffect({
         kind: 'text',
         x: (col + 0.5) * TILE_SIZE,
         y: (row + 0.4) * TILE_SIZE,
@@ -293,6 +376,7 @@ export class CastleTdEngine {
         maxRadius: 0,
         color: '#f87171',
         text: `Need ${def.cost}g`,
+        bold: true,
         life: 0.9,
         maxLife: 0.9,
       });
@@ -316,20 +400,22 @@ export class CastleTdEngine {
       cooldown: 0,
       angle: -Math.PI / 2,
       muzzleFlash: 0,
+      recoil: 0,
       beamTargetId: null,
       beamRamp: 0,
     };
     this.towers.push(tower);
-    this.effects.push({
+    this.pushEffect({
       kind: 'ring',
       x: tower.x,
       y: tower.y,
       radius: 8,
-      maxRadius: TILE_SIZE * 0.75,
+      maxRadius: TILE_SIZE * 0.78,
       color: def.color,
-      life: 0.32,
-      maxLife: 0.32,
+      life: 0.34,
+      maxLife: 0.34,
     });
+    this.spawnSparks(tower.x, tower.y, def.accent, 8, 95);
     soundFx.place();
     this.pushHud(true);
   }
@@ -343,7 +429,7 @@ export class CastleTdEngine {
       const canSpec = tower.baseUpgrades === 10 && tower.specType !== null && tower.specUpgrades < 10;
       if (!canBase && !canSpec) break;
       const cost = this.getUpgradeCost(tower);
-      if (this.gold < cost) break;
+      if (cost <= 0 || this.gold < cost) break;
       this.gold -= cost;
       tower.totalSpent += cost;
       if (canBase) tower.baseUpgrades++;
@@ -352,16 +438,17 @@ export class CastleTdEngine {
     }
     if (didAny) {
       soundFx.upgrade(false);
-      this.effects.push({
+      this.pushEffect({
         kind: 'ring',
         x: tower.x,
         y: tower.y,
         radius: 10,
-        maxRadius: TILE_SIZE * 0.95,
+        maxRadius: TILE_SIZE * 0.98,
         color: '#facc15',
-        life: 0.36,
-        maxLife: 0.36,
+        life: 0.38,
+        maxLife: 0.38,
       });
+      this.spawnSparks(tower.x, tower.y, '#fef08a', 10, 120);
       this.pushHud(true);
     }
     return didAny;
@@ -379,16 +466,17 @@ export class CastleTdEngine {
     tower.specType = specId;
     tower.specUpgrades = 0;
     soundFx.upgrade(true);
-    this.effects.push({
+    this.pushEffect({
       kind: 'ring',
       x: tower.x,
       y: tower.y,
       radius: 12,
-      maxRadius: TILE_SIZE * 1.4,
+      maxRadius: TILE_SIZE * 1.45,
       color: spec.color,
-      life: 0.5,
-      maxLife: 0.5,
+      life: 0.52,
+      maxLife: 0.52,
     });
+    this.spawnSparks(tower.x, tower.y, spec.accent, 16, 150);
     this.pushHud(true);
     return true;
   }
@@ -408,7 +496,7 @@ export class CastleTdEngine {
     this.gold += refund;
     this.towers = this.towers.filter((t) => t.id !== tower.id);
     this.selectedTowerId = null;
-    this.effects.push({
+    this.pushEffect({
       kind: 'text',
       x: tower.x,
       y: tower.y,
@@ -416,9 +504,11 @@ export class CastleTdEngine {
       maxRadius: 0,
       color: '#fde047',
       text: `+${refund}g`,
-      life: 0.85,
-      maxLife: 0.85,
+      bold: true,
+      life: 0.9,
+      maxLife: 0.9,
     });
+    this.spawnSparks(tower.x, tower.y, '#facc15', 8, 85);
     this.pushHud(true);
   }
 
@@ -428,6 +518,18 @@ export class CastleTdEngine {
     this.gold -= cost;
     this.castleHp = Math.min(this.castleMaxHp, this.castleHp + 35);
     soundFx.upgrade(false);
+    this.pushEffect({
+      kind: 'text',
+      x: (CASTLE_TILE.col + 0.5) * TILE_SIZE,
+      y: (CASTLE_TILE.row - 0.3) * TILE_SIZE,
+      radius: 0,
+      maxRadius: 0,
+      color: '#4ade80',
+      text: '+35 HP',
+      bold: true,
+      life: 0.95,
+      maxLife: 0.95,
+    });
     this.pushHud(true);
   }
 
@@ -439,6 +541,16 @@ export class CastleTdEngine {
     this.castleMaxHp += 40;
     this.castleHp += 40;
     soundFx.upgrade(true);
+    this.pushEffect({
+      kind: 'ring',
+      x: (CASTLE_TILE.col + 0.5) * TILE_SIZE,
+      y: (CASTLE_TILE.row + 0.5) * TILE_SIZE,
+      radius: 16,
+      maxRadius: TILE_SIZE * 1.4,
+      color: '#38bdf8',
+      life: 0.5,
+      maxLife: 0.5,
+    });
     this.pushHud(true);
   }
 
@@ -452,10 +564,25 @@ export class CastleTdEngine {
 
   sendNextWaveEarly(): void {
     if (this.gameOver) return;
+    if (this.spawnQueue.length > 600) {
+      this.pushEffect({
+        kind: 'text',
+        x: (SPAWN_TILE.col + 1.4) * TILE_SIZE,
+        y: (SPAWN_TILE.row + 0.8) * TILE_SIZE,
+        radius: 0,
+        maxRadius: 0,
+        color: '#fca5a5',
+        text: 'Wave Queue Full!',
+        bold: true,
+        life: 0.85,
+        maxLife: 0.85,
+      });
+      return;
+    }
     const earlyBonus = this.spawnQueue.length > 0 || this.monsters.length > 0 ? 35 + this.wave * 6 : 0;
     if (earlyBonus > 0) {
       this.gold += earlyBonus;
-      this.effects.push({
+      this.pushEffect({
         kind: 'text',
         x: (SPAWN_TILE.col + 1.2) * TILE_SIZE,
         y: (SPAWN_TILE.row + 0.8) * TILE_SIZE,
@@ -463,11 +590,42 @@ export class CastleTdEngine {
         maxRadius: 0,
         color: '#facc15',
         text: `⚡ +${earlyBonus}g`,
+        bold: true,
         life: 1.0,
         maxLife: 1.0,
       });
     }
     this.triggerNextWave();
+  }
+
+  private pushEffect(e: VisualEffect): void {
+    if (this.effects.length >= 220) {
+      this.effects.shift();
+    }
+    this.effects.push(e);
+  }
+
+  private spawnSparks(x: number, y: number, color: string, count: number, speed = 110): void {
+    if (this.effects.length > 195) return;
+    const n = Math.min(count, 16);
+    for (let i = 0; i < n; i++) {
+      const a = (Math.PI * 2 * i) / n + (Math.random() - 0.5) * 0.5;
+      const sp = speed * (0.45 + Math.random() * 0.7);
+      const life = 0.24 + Math.random() * 0.24;
+      this.pushEffect({
+        kind: 'spark',
+        x,
+        y,
+        vx: Math.cos(a) * sp,
+        vy: Math.sin(a) * sp,
+        gravity: 130,
+        radius: 1.8 + Math.random() * 2.2,
+        maxRadius: 0,
+        color,
+        life,
+        maxLife: life,
+      });
+    }
   }
 
   private triggerNextWave(): void {
@@ -527,7 +685,7 @@ export class CastleTdEngine {
     > = {
       slime: { hp: 38, speed: 62, armor: 0, dmg: 2, radius: 10, color: '#4ade80' },
       goblin: { hp: 56, speed: 78, armor: 1, dmg: 3, radius: 11, color: '#a3e635' },
-      runner: { hp: 42, speed: 120, armor: 0, dmg: 3, radius: 9, color: '#fbbf24' },
+      runner: { hp: 42, speed: 120, armor: 0, dmg: 3, radius: 9.5, color: '#fbbf24' },
       orc: { hp: 135, speed: 56, armor: 3, dmg: 5, radius: 14, color: '#fb7185' },
       knight: { hp: 220, speed: 50, armor: 9, dmg: 8, radius: 15, color: '#94a3b8' },
       golem: { hp: 420, speed: 42, armor: 14, dmg: 12, radius: 17, color: '#f97316' },
@@ -535,7 +693,7 @@ export class CastleTdEngine {
     };
 
     const spec = baseSpecs[sp.kind];
-    const maxHp = Math.round(spec.hp * sp.hpScale);
+    const maxHp = Math.max(1, Math.round(spec.hp * sp.hpScale));
 
     this.monsters.push({
       id: this.nextEntityId++,
@@ -594,7 +752,7 @@ export class CastleTdEngine {
     // Update monsters
     for (let i = this.monsters.length - 1; i >= 0; i--) {
       const m = this.monsters[i];
-      if (m.hitFlash > 0) m.hitFlash = Math.max(0, m.hitFlash - rawDt * 5);
+      if (m.hitFlash > 0) m.hitFlash = Math.max(0, m.hitFlash - rawDt * 5.5);
 
       if (m.poisonTimer > 0) {
         m.poisonTimer -= dt;
@@ -606,7 +764,7 @@ export class CastleTdEngine {
       }
 
       if (m.hp <= 0) {
-        this.handleMonsterDeath(m, null);
+        this.handleMonsterDeath(m);
         this.monsters.splice(i, 1);
         continue;
       }
@@ -634,11 +792,13 @@ export class CastleTdEngine {
           m.pathIndex++;
           m.progress = m.pathIndex;
           moveDist -= dist;
-        } else {
+        } else if (dist > 0.0001) {
           m.x += (dx / dist) * moveDist;
           m.y += (dy / dist) * moveDist;
           m.progress = m.pathIndex + (1 - dist / Math.max(1, TILE_SIZE * 8));
           moveDist = 0;
+        } else {
+          break;
         }
       }
 
@@ -647,7 +807,7 @@ export class CastleTdEngine {
         this.castleHp = Math.max(0, this.castleHp - m.castleDmg);
         this.castleHitFlash = 1;
         soundFx.castleHit();
-        this.effects.push({
+        this.pushEffect({
           kind: 'text',
           x: (CASTLE_TILE.col + 0.5) * TILE_SIZE,
           y: CASTLE_TILE.row * TILE_SIZE,
@@ -655,9 +815,11 @@ export class CastleTdEngine {
           maxRadius: 0,
           color: '#ef4444',
           text: `-${m.castleDmg} ❤️`,
-          life: 0.9,
-          maxLife: 0.9,
+          bold: true,
+          life: 0.95,
+          maxLife: 0.95,
         });
+        this.spawnSparks((CASTLE_TILE.col + 0.5) * TILE_SIZE, (CASTLE_TILE.row + 0.3) * TILE_SIZE, '#f87171', 8, 120);
         this.monsters.splice(i, 1);
         if (this.castleHp <= 0) {
           this.gameOver = true;
@@ -670,7 +832,8 @@ export class CastleTdEngine {
 
     // Update towers
     for (const tower of this.towers) {
-      if (tower.muzzleFlash > 0) tower.muzzleFlash = Math.max(0, tower.muzzleFlash - rawDt * 6);
+      if (tower.muzzleFlash > 0) tower.muzzleFlash = Math.max(0, tower.muzzleFlash - rawDt * 6.5);
+      if (tower.recoil > 0) tower.recoil = Math.max(0, tower.recoil - rawDt * 7.5);
       tower.cooldown -= dt;
       if (tower.cooldown > 0) continue;
 
@@ -686,6 +849,7 @@ export class CastleTdEngine {
       tower.angle = Math.atan2(primary.y - tower.y, primary.x - tower.x);
       tower.cooldown = 1 / Math.max(0.15, stats.fireRate);
       tower.muzzleFlash = 1;
+      tower.recoil = 1;
 
       if (tower.specType === 'laser') {
         if (tower.beamTargetId === primary.id) {
@@ -696,31 +860,32 @@ export class CastleTdEngine {
         }
         const dmg = Math.round(stats.damage * tower.beamRamp);
         this.applyDamage(primary, dmg, tower, true);
-        this.effects.push({
+        this.pushEffect({
           kind: 'lightning',
           points: [
-            { x: tower.x, y: tower.y },
+            { x: tower.x + Math.cos(tower.angle) * 14, y: tower.y + Math.sin(tower.angle) * 14 },
             { x: primary.x, y: primary.y },
           ],
           x: tower.x,
           y: tower.y,
-          radius: 3,
-          maxRadius: 3,
+          radius: Math.min(5.5, 2.2 + tower.beamRamp * 0.7),
+          maxRadius: 4,
           color: stats.color,
           life: 0.14,
           maxLife: 0.14,
         });
-      } else if (tower.specType === 'blizzard' || tower.baseType === 'frost' || tower.specType === 'chrono') {
-        // AoE frost pulse around tower / targets
-        this.effects.push({
+        this.spawnSparks(primary.x, primary.y, '#fbcfe8', 3, 75);
+      } else if (tower.specType === 'blizzard' || tower.specType === 'chrono' || (tower.baseType === 'frost' && tower.specType !== 'cryo')) {
+        // AoE frost / blizzard / chrono pulse around tower
+        this.pushEffect({
           kind: 'ring',
           x: tower.x,
           y: tower.y,
           radius: 16,
           maxRadius: stats.rangePx,
           color: stats.color,
-          life: 0.28,
-          maxLife: 0.28,
+          life: 0.3,
+          maxLife: 0.3,
         });
         const hitRadius = Math.max(stats.rangePx, stats.splashPx);
         for (const m of this.monsters) {
@@ -736,7 +901,9 @@ export class CastleTdEngine {
       } else if (stats.chainCount > 0) {
         // Instant chain lightning!
         soundFx.zap();
-        const pts: { x: number; y: number }[] = [{ x: tower.x, y: tower.y }];
+        const muzzleX = tower.x + Math.cos(tower.angle) * 12;
+        const muzzleY = tower.y + Math.sin(tower.angle) * 12;
+        const pts: { x: number; y: number }[] = [{ x: muzzleX, y: muzzleY }];
         const hitSet = new Set<number>();
         let currTarget: MonsterInstance | null = primary;
         let dmg = stats.damage;
@@ -756,7 +923,10 @@ export class CastleTdEngine {
           // Tesla splash around hit
           if (stats.splashPx > 0) {
             for (const near of this.monsters) {
-              if (near.id !== currTarget.id && Math.hypot(near.x - currTarget.x, near.y - currTarget.y) <= stats.splashPx * 0.65) {
+              if (
+                near.id !== currTarget.id &&
+                Math.hypot(near.x - currTarget.x, near.y - currTarget.y) <= stats.splashPx * 0.65
+              ) {
                 this.applyDamage(near, Math.round(dmg * 0.45), tower, false);
               }
             }
@@ -776,35 +946,64 @@ export class CastleTdEngine {
           dmg *= 0.86;
         }
 
-        this.effects.push({
+        this.pushEffect({
           kind: 'lightning',
           points: pts,
           x: tower.x,
           y: tower.y,
-          radius: 2,
-          maxRadius: 2,
+          radius: 2.2,
+          maxRadius: 2.2,
           color: stats.color,
-          life: 0.16,
-          maxLife: 0.16,
+          life: 0.18,
+          maxLife: 0.18,
         });
       } else {
-        // Projectiles (single or multi-shot)
+        // Projectiles (single, multi-shot, cryo rays, cannon, mortar, inferno)
+        const projKind: ProjectileVisualKind =
+          tower.specType === 'sniper'
+            ? 'sniper'
+            : tower.specType === 'venom'
+              ? 'venom'
+              : tower.specType === 'mortar'
+                ? 'mortar'
+                : tower.specType === 'inferno'
+                  ? 'inferno'
+                  : tower.specType === 'cryo'
+                    ? 'cryo'
+                    : tower.baseType === 'cannon'
+                      ? 'cannon'
+                      : 'arrow';
+
         for (const tgt of targets) {
           const isCrit = tower.specType === 'sniper' && Math.random() < 0.35;
-          const speed = tower.baseType === 'archer' ? 460 : 340;
+          const speed =
+            tower.specType === 'sniper'
+              ? 640
+              : tower.specType === 'cryo'
+                ? 440
+                : tower.baseType === 'archer'
+                  ? 470
+                  : 345;
           const dx = tgt.x - tower.x;
           const dy = tgt.y - tower.y;
           const dist = Math.max(1, Math.hypot(dx, dy));
+          const sx = tower.x + (dx / dist) * 14;
+          const sy = tower.y + (dy / dist) * 14;
+          if (this.projectiles.length >= 260) {
+            this.projectiles.shift();
+          }
           this.projectiles.push({
-            x: tower.x + (dx / dist) * 14,
-            y: tower.y + (dy / dist) * 14,
+            x: sx,
+            y: sy,
+            prevX: sx,
+            prevY: sy,
             vx: (dx / dist) * speed,
             vy: (dy / dist) * speed,
             targetId: tgt.id,
             speed,
             damage: isCrit ? Math.round(stats.damage * 2.1) : stats.damage,
             color: stats.color,
-            radius: tower.baseType === 'cannon' ? 5.5 : 3.8,
+            radius: projKind === 'mortar' ? 6.8 : tower.baseType === 'cannon' ? 5.2 : projKind === 'cryo' ? 4.6 : 3.8,
             splashRadius: stats.splashPx,
             slowAmount: stats.slowAmount,
             freezeChance: stats.freezeChance,
@@ -812,8 +1011,9 @@ export class CastleTdEngine {
             burnDps: tower.specType === 'inferno' ? stats.poisonDps : 0,
             isArrow: tower.baseType === 'archer',
             isCrit,
+            kind: projKind,
             towerId: tower.id,
-            life: 1.5,
+            life: 1.6,
           });
         }
       }
@@ -823,23 +1023,32 @@ export class CastleTdEngine {
     for (let i = this.projectiles.length - 1; i >= 0; i--) {
       const p = this.projectiles[i];
       p.life -= dt;
-      if (p.life <= 0) {
+      if (p.life <= 0 || !Number.isFinite(p.x) || !Number.isFinite(p.y)) {
         this.projectiles.splice(i, 1);
         continue;
       }
+
+      p.prevX = p.x;
+      p.prevY = p.y;
 
       const tgt = this.monsters.find((m) => m.id === p.targetId);
       if (tgt) {
         const dx = tgt.x - p.x;
         const dy = tgt.y - p.y;
         const d = Math.hypot(dx, dy);
-        if (d <= p.speed * dt + tgt.radius + 3) {
+        if (!Number.isFinite(d)) {
+          this.projectiles.splice(i, 1);
+          continue;
+        }
+        if (d <= p.speed * dt + tgt.radius + 4) {
           this.detonateProjectile(p, tgt);
           this.projectiles.splice(i, 1);
           continue;
         }
-        p.vx = (dx / d) * p.speed;
-        p.vy = (dy / d) * p.speed;
+        if (d > 0.001) {
+          p.vx = (dx / d) * p.speed;
+          p.vy = (dy / d) * p.speed;
+        }
       }
 
       p.x += p.vx * dt;
@@ -849,20 +1058,27 @@ export class CastleTdEngine {
     // Prune dead monsters killed by tower hits this frame
     for (let i = this.monsters.length - 1; i >= 0; i--) {
       if (this.monsters[i].hp <= 0) {
-        this.handleMonsterDeath(this.monsters[i], null);
+        this.handleMonsterDeath(this.monsters[i]);
         this.monsters.splice(i, 1);
       }
     }
 
-    // Update effects (cap count to keep 60 FPS with 100s of enemies)
-    if (this.effects.length > 140) {
-      this.effects.splice(0, this.effects.length - 140);
+    // Update effects (rings, lightning, sparks, text)
+    if (this.effects.length > 220) {
+      this.effects.splice(0, this.effects.length - 220);
     }
     for (let i = this.effects.length - 1; i >= 0; i--) {
       const e = this.effects[i];
       e.life -= rawDt;
       if (e.life <= 0) {
         this.effects.splice(i, 1);
+        continue;
+      }
+      if (e.kind === 'spark' && e.vx !== undefined && e.vy !== undefined) {
+        e.x += e.vx * rawDt;
+        e.y += e.vy * rawDt;
+        e.vy += (e.gravity ?? 0) * rawDt;
+        e.vx *= 0.96;
       }
     }
   }
@@ -871,17 +1087,26 @@ export class CastleTdEngine {
     const owner = this.towers.find((t) => t.id === p.towerId) ?? null;
 
     if (p.splashRadius > 0) {
-      soundFx.boom();
-      this.effects.push({
+      if (p.kind === 'cannon' || p.kind === 'mortar' || p.kind === 'inferno') {
+        soundFx.boom();
+      }
+      this.pushEffect({
         kind: 'ring',
         x: directTarget.x,
         y: directTarget.y,
         radius: 6,
         maxRadius: p.splashRadius,
         color: p.color,
-        life: 0.24,
-        maxLife: 0.24,
+        life: 0.26,
+        maxLife: 0.26,
       });
+      this.spawnSparks(
+        directTarget.x,
+        directTarget.y,
+        p.kind === 'cryo' ? '#a5f3fc' : p.kind === 'venom' ? '#bef264' : '#fde047',
+        p.kind === 'mortar' ? 10 : 6,
+        p.kind === 'mortar' ? 140 : 95
+      );
 
       for (const m of this.monsters) {
         const d = Math.hypot(m.x - directTarget.x, m.y - directTarget.y);
@@ -891,6 +1116,9 @@ export class CastleTdEngine {
           if (p.slowAmount > 0) {
             m.slowAmount = Math.max(m.slowAmount, p.slowAmount);
             m.slowTimer = Math.max(m.slowTimer, 2.5);
+          }
+          if (p.freezeChance > 0 && m.kind !== 'boss' && Math.random() < p.freezeChance) {
+            m.freezeTimer = Math.max(m.freezeTimer, 1.25);
           }
           if (p.poisonDps > 0) {
             m.poisonDps = Math.max(m.poisonDps, p.poisonDps);
@@ -908,22 +1136,32 @@ export class CastleTdEngine {
         directTarget.slowAmount = Math.max(directTarget.slowAmount, p.slowAmount);
         directTarget.slowTimer = Math.max(directTarget.slowTimer, 2.5);
       }
+      if (p.freezeChance > 0 && directTarget.kind !== 'boss' && Math.random() < p.freezeChance) {
+        directTarget.freezeTimer = Math.max(directTarget.freezeTimer, 1.25);
+      }
       if (p.poisonDps > 0) {
         directTarget.poisonDps = Math.max(directTarget.poisonDps, p.poisonDps);
         directTarget.poisonTimer = 4.0;
+      }
+      if (p.burnDps > 0) {
+        directTarget.burnDps = Math.max(directTarget.burnDps, p.burnDps);
+        directTarget.burnTimer = 3.5;
+      }
+      if (p.isCrit) {
+        this.spawnSparks(directTarget.x, directTarget.y, '#fde047', 6, 115);
       }
     }
   }
 
   private applyDamage(m: MonsterInstance, rawDmg: number, owner: TowerInstance | null, ignoreArmor: boolean): void {
-    if (m.hp <= 0) return;
+    if (m.hp <= 0 || !Number.isFinite(rawDmg)) return;
     const effectiveArmor = ignoreArmor ? 0 : m.armor;
-    const dmg = Math.max(2, rawDmg - effectiveArmor);
+    const dmg = Math.max(2, Math.round(rawDmg) - effectiveArmor);
     const wasAlive = m.hp > 0;
     m.hp -= dmg;
     m.hitFlash = 1;
-    if (ignoreArmor && this.effects.length < 110) {
-      this.effects.push({
+    if (ignoreArmor && this.effects.length < 180) {
+      this.pushEffect({
         kind: 'text',
         x: m.x,
         y: m.y - 12,
@@ -931,8 +1169,9 @@ export class CastleTdEngine {
         maxRadius: 0,
         color: '#fde047',
         text: `💥${dmg}`,
-        life: 0.45,
-        maxLife: 0.45,
+        bold: true,
+        life: 0.48,
+        maxLife: 0.48,
       });
     }
     if (wasAlive && m.hp <= 0 && owner) {
@@ -940,20 +1179,36 @@ export class CastleTdEngine {
     }
   }
 
-  private handleMonsterDeath(m: MonsterInstance, _owner: TowerInstance | null): void {
+  private handleMonsterDeath(m: MonsterInstance): void {
     this.gold += m.reward;
     this.kills++;
     this.score += m.reward * 5 + this.wave * 2;
-    if (this.effects.length < 110) {
-      this.effects.push({
-        kind: 'ring',
+    this.pushEffect({
+      kind: 'ring',
+      x: m.x,
+      y: m.y,
+      radius: 4,
+      maxRadius: m.radius * (m.kind === 'boss' ? 2.6 : 1.85),
+      color: m.color,
+      life: 0.24,
+      maxLife: 0.24,
+    });
+    this.spawnSparks(m.x, m.y, m.kind === 'boss' ? '#facc15' : m.color, m.kind === 'boss' ? 14 : 5, 105);
+
+    const now = performance.now();
+    if (m.kind === 'boss' || now - this.lastGoldPopupAt > 180) {
+      this.lastGoldPopupAt = now;
+      this.pushEffect({
+        kind: 'text',
         x: m.x,
-        y: m.y,
-        radius: 4,
-        maxRadius: m.radius * 1.8,
-        color: m.color,
-        life: 0.22,
-        maxLife: 0.22,
+        y: m.y - m.radius * 0.7,
+        radius: 0,
+        maxRadius: 0,
+        color: '#fde047',
+        text: `+${m.reward}g`,
+        bold: m.kind === 'boss',
+        life: 0.65,
+        maxLife: 0.65,
       });
     }
   }
@@ -978,160 +1233,266 @@ export class CastleTdEngine {
     return inRange.slice(0, Math.max(1, count)).map((item) => item.m);
   }
 
-  private render(): void {
-    const dpr = Math.min(2, window.devicePixelRatio || 1);
-    const rect = this.canvas.getBoundingClientRect();
-    const cw = Math.max(1, Math.round(rect.width * dpr));
-    const ch = Math.max(1, Math.round(rect.height * dpr));
-    if (this.canvas.width !== cw || this.canvas.height !== ch) {
-      this.canvas.width = cw;
-      this.canvas.height = ch;
+  private getTerrainCache(): HTMLCanvasElement {
+    if (this.terrainCache) return this.terrainCache;
+
+    const c = document.createElement('canvas');
+    c.width = WORLD_W;
+    c.height = WORLD_H;
+    const g = c.getContext('2d')!;
+
+    // Base rich forest backdrop
+    g.fillStyle = '#0f231b';
+    g.fillRect(0, 0, WORLD_W, WORLD_H);
+
+    for (let r = 0; r < GRID_ROWS; r++) {
+      for (let col = 0; col < GRID_COLS; col++) {
+        const x = col * TILE_SIZE;
+        const y = r * TILE_SIZE;
+        const path = isPathTile(col, r);
+        const h1 = hash2d(col, r, 1);
+        const h2 = hash2d(col, r, 2);
+        const h3 = hash2d(col, r, 3);
+
+        if (path) {
+          // Dirt mortar base
+          g.fillStyle = (col + r) % 2 === 0 ? '#3a2f26' : '#332920';
+          g.fillRect(x, y, TILE_SIZE, TILE_SIZE);
+
+          // Cobblestone blocks
+          const rows = 3;
+          const cols = 3;
+          const cw = TILE_SIZE / cols;
+          const ch = TILE_SIZE / rows;
+          for (let sr = 0; sr < rows; sr++) {
+            for (let sc = 0; sc < cols; sc++) {
+              const sh = hash2d(col * 3 + sc, r * 3 + sr, 9);
+              const jx = (sh - 0.5) * 3;
+              const jy = (hash2d(col * 3 + sc, r * 3 + sr, 13) - 0.5) * 3;
+              const bx = x + sc * cw + 2 + jx;
+              const by = y + sr * ch + 2 + jy;
+              const bw = cw - 4.5;
+              const bh = ch - 4.5;
+              const tone = Math.floor(72 + sh * 26);
+              g.fillStyle = `rgb(${tone + 14}, ${tone + 6}, ${tone - 4})`;
+              g.beginPath();
+              g.roundRect(bx, by, bw, bh, 4);
+              g.fill();
+              // Top highlight on stone
+              g.fillStyle = 'rgba(255,255,255,0.08)';
+              g.fillRect(bx + 2, by + 1, bw - 4, 2);
+              // Bottom shadow
+              g.fillStyle = 'rgba(0,0,0,0.22)';
+              g.fillRect(bx + 1, by + bh - 2, bw - 2, 2);
+            }
+          }
+
+          // Tiny scattered pebbles on path
+          for (let p = 0; p < 3; p++) {
+            const px = x + 8 + hash2d(col, r, 30 + p) * (TILE_SIZE - 16);
+            const py = y + 8 + hash2d(col, r, 40 + p) * (TILE_SIZE - 16);
+            g.fillStyle = 'rgba(226, 209, 185, 0.22)';
+            g.beginPath();
+            g.arc(px, py, 1.4 + hash2d(col, r, 50 + p) * 1.2, 0, Math.PI * 2);
+            g.fill();
+          }
+
+          // Raised stone curb borders where path meets grass
+          const nb = getPathNeighbors(col, r);
+          g.fillStyle = '#5c5346';
+          if (!nb.top) g.fillRect(x, y, TILE_SIZE, 4);
+          if (!nb.bottom) g.fillRect(x, y + TILE_SIZE - 4, TILE_SIZE, 4);
+          if (!nb.left) g.fillRect(x, y, 4, TILE_SIZE);
+          if (!nb.right) g.fillRect(x + TILE_SIZE - 4, y, 4, TILE_SIZE);
+          g.fillStyle = 'rgba(0,0,0,0.25)';
+          if (!nb.top) g.fillRect(x, y + 4, TILE_SIZE, 2);
+          if (!nb.left) g.fillRect(x + 4, y, 2, TILE_SIZE);
+        } else {
+          // Mossy meadow tile
+          const greenVar = Math.floor(h1 * 12);
+          g.fillStyle =
+            (col + r) % 2 === 0
+              ? `rgb(${21 + greenVar}, ${54 + greenVar}, ${38 + Math.floor(greenVar * 0.6)})`
+              : `rgb(${25 + greenVar}, ${61 + greenVar}, ${43 + Math.floor(greenVar * 0.6)})`;
+          g.fillRect(x, y, TILE_SIZE, TILE_SIZE);
+
+          // Soft moss patch
+          g.fillStyle = h2 > 0.5 ? 'rgba(74, 222, 128, 0.08)' : 'rgba(16, 185, 129, 0.07)';
+          g.beginPath();
+          g.ellipse(
+            x + 14 + h2 * 26,
+            y + 14 + h3 * 26,
+            10 + h1 * 8,
+            7 + h2 * 6,
+            h3 * Math.PI,
+            0,
+            Math.PI * 2
+          );
+          g.fill();
+
+          // Grass blade tufts
+          g.strokeStyle = 'rgba(134, 239, 172, 0.16)';
+          g.lineWidth = 1.2;
+          for (let t = 0; t < 2; t++) {
+            const tx = x + 10 + hash2d(col, r, 70 + t) * (TILE_SIZE - 20);
+            const ty = y + 14 + hash2d(col, r, 80 + t) * (TILE_SIZE - 20);
+            g.beginPath();
+            g.moveTo(tx, ty);
+            g.lineTo(tx - 3, ty - 5);
+            g.moveTo(tx, ty);
+            g.lineTo(tx + 2.5, ty - 6);
+            g.stroke();
+          }
+
+          // Occasional wildflower or mossy pebble
+          if (h3 > 0.72) {
+            const fx = x + 10 + h1 * 36;
+            const fy = y + 10 + h2 * 36;
+            g.fillStyle = h1 > 0.5 ? '#fde047' : '#e2e8f0';
+            g.beginPath();
+            g.arc(fx, fy, 1.8, 0, Math.PI * 2);
+            g.fill();
+          }
+
+          // Subtle tile seam
+          g.strokeStyle = 'rgba(0, 0, 0, 0.16)';
+          g.lineWidth = 1;
+          g.strokeRect(x + 0.5, y + 0.5, TILE_SIZE - 1, TILE_SIZE - 1);
+        }
+      }
     }
 
-    const ctx = this.ctx;
-    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-    ctx.fillStyle = '#0b1322';
-    ctx.fillRect(0, 0, rect.width, rect.height);
+    // Castle stone courtyard apron around CASTLE_TILE
+    const cx = (CASTLE_TILE.col + 0.5) * TILE_SIZE;
+    const cy = (CASTLE_TILE.row + 0.5) * TILE_SIZE;
+    const apronGrad = g.createRadialGradient(cx, cy, 10, cx, cy, TILE_SIZE * 1.15);
+    apronGrad.addColorStop(0, 'rgba(30, 58, 138, 0.45)');
+    apronGrad.addColorStop(1, 'rgba(15, 23, 42, 0)');
+    g.fillStyle = apronGrad;
+    g.beginPath();
+    g.arc(cx, cy, TILE_SIZE * 1.15, 0, Math.PI * 2);
+    g.fill();
 
-    this.scale = Math.min(rect.width / WORLD_W, rect.height / WORLD_H);
-    this.offsetX = (rect.width - WORLD_W * this.scale) * 0.5;
-    this.offsetY = (rect.height - WORLD_H * this.scale) * 0.5;
+    this.terrainCache = c;
+    return c;
+  }
+
+  private render(): void {
+    this.syncCanvasMetrics();
+    if (this.cssW < 2 || this.cssH < 2 || !(this.scale > 0)) return;
+
+    const ctx = this.ctx;
+    ctx.setTransform(this.dpr, 0, 0, this.dpr, 0, 0);
+    ctx.fillStyle = '#070f1d';
+    ctx.fillRect(0, 0, this.cssW, this.cssH);
 
     ctx.save();
     ctx.translate(this.offsetX, this.offsetY);
     ctx.scale(this.scale, this.scale);
 
-    // Draw grid tiles
-    for (let r = 0; r < GRID_ROWS; r++) {
-      for (let c = 0; c < GRID_COLS; c++) {
-        const x = c * TILE_SIZE;
-        const y = r * TILE_SIZE;
-        const path = isPathTile(c, r);
-        if (path) {
-          ctx.fillStyle = (c + r) % 2 === 0 ? '#3b332b' : '#352e27';
-          ctx.fillRect(x, y, TILE_SIZE, TILE_SIZE);
-          ctx.strokeStyle = 'rgba(255,255,255,0.05)';
-          ctx.strokeRect(x + 2, y + 2, TILE_SIZE - 4, TILE_SIZE - 4);
-        } else {
-          ctx.fillStyle = (c + r) % 2 === 0 ? '#162922' : '#193028';
-          ctx.fillRect(x, y, TILE_SIZE, TILE_SIZE);
-          if (this.buildTool) {
-            ctx.strokeStyle = 'rgba(74, 222, 128, 0.14)';
-            ctx.lineWidth = 1;
-            ctx.strokeRect(x + 3, y + 3, TILE_SIZE - 6, TILE_SIZE - 6);
-          }
+    // 1. Static cached battlefield terrain
+    ctx.drawImage(this.getTerrainCache(), 0, 0);
+
+    // 2. Buildable tile grid cues & hover preview
+    if (this.buildTool) {
+      ctx.lineWidth = 1.2;
+      const pulse = 0.14 + Math.sin(this.animTime * 4) * 0.05;
+      ctx.strokeStyle = `rgba(134, 239, 172, ${pulse.toFixed(3)})`;
+      for (let r = 0; r < GRID_ROWS; r++) {
+        for (let c = 0; c < GRID_COLS; c++) {
+          if (isPathTile(c, r)) continue;
+          if (this.towers.some((t) => t.col === c && t.row === r)) continue;
+          const x = c * TILE_SIZE;
+          const y = r * TILE_SIZE;
+          ctx.strokeRect(x + 4, y + 4, TILE_SIZE - 8, TILE_SIZE - 8);
+        }
+      }
+
+      if (this.hoverTile && !isPathTile(this.hoverTile.col, this.hoverTile.row)) {
+        const occ = this.towers.some((t) => t.col === this.hoverTile!.col && t.row === this.hoverTile!.row);
+        if (!occ) {
+          const def = BASE_TOWERS[this.buildTool];
+          const hx = (this.hoverTile.col + 0.5) * TILE_SIZE;
+          const hy = (this.hoverTile.row + 0.5) * TILE_SIZE;
+          const rangePx = def.range * TILE_SIZE;
+          ctx.beginPath();
+          ctx.arc(hx, hy, rangePx, 0, Math.PI * 2);
+          ctx.fillStyle = this.gold >= def.cost ? 'rgba(74, 222, 128, 0.10)' : 'rgba(248, 113, 113, 0.10)';
+          ctx.fill();
+          ctx.strokeStyle = this.gold >= def.cost ? 'rgba(74, 222, 128, 0.55)' : 'rgba(248, 113, 113, 0.55)';
+          ctx.setLineDash([5, 5]);
+          ctx.stroke();
+          ctx.setLineDash([]);
         }
       }
     }
 
-    // Subtle path center line
+    // 3. Subtle marching guide arrows along path
     ctx.beginPath();
     WORLD_WAYPOINTS.forEach((p, idx) => {
       if (idx === 0) ctx.moveTo(p.x, p.y);
       else ctx.lineTo(p.x, p.y);
     });
     ctx.strokeStyle = 'rgba(245, 158, 11, 0.16)';
-    ctx.lineWidth = 4;
-    ctx.setLineDash([8, 10]);
+    ctx.lineWidth = 3;
+    ctx.setLineDash([8, 12]);
+    ctx.lineDashOffset = -this.animTime * 22;
     ctx.stroke();
     ctx.setLineDash([]);
+    ctx.lineDashOffset = 0;
 
-    // Draw Spawn Portal
+    // 4. Spawn Portal & Shimmering Moat + Castle Keep
     this.drawSpawnPortal(ctx);
+    this.drawCastleMoatAndKeep(ctx);
 
-    // Draw Castle at end of path
-    this.drawCastle(ctx);
+    // 5. Chrono Aura buff links & Selected tower range ring
+    for (const t of this.towers) {
+      if (t.specType === 'chrono') {
+        const auraGrad = ctx.createRadialGradient(t.x, t.y, 12, t.x, t.y, TILE_SIZE * 2.8);
+        auraGrad.addColorStop(0, 'rgba(99, 102, 241, 0.10)');
+        auraGrad.addColorStop(1, 'rgba(99, 102, 241, 0)');
+        ctx.fillStyle = auraGrad;
+        ctx.beginPath();
+        ctx.arc(t.x, t.y, TILE_SIZE * 2.8, 0, Math.PI * 2);
+        ctx.fill();
+      }
+    }
 
-    // Selected tower range circle
     const selected = this.getSelectedTower();
     if (selected) {
       const stats = this.getTowerStats(selected);
+      const rg = ctx.createRadialGradient(selected.x, selected.y, stats.rangePx * 0.2, selected.x, selected.y, stats.rangePx);
+      rg.addColorStop(0, 'rgba(56, 189, 248, 0.04)');
+      rg.addColorStop(0.8, 'rgba(56, 189, 248, 0.12)');
+      rg.addColorStop(1, 'rgba(56, 189, 248, 0.24)');
       ctx.beginPath();
       ctx.arc(selected.x, selected.y, stats.rangePx, 0, Math.PI * 2);
-      ctx.fillStyle = 'rgba(56, 189, 248, 0.10)';
+      ctx.fillStyle = rg;
       ctx.fill();
-      ctx.strokeStyle = 'rgba(56, 189, 248, 0.72)';
+      ctx.strokeStyle = 'rgba(125, 211, 252, 0.82)';
       ctx.lineWidth = 2;
+      ctx.setLineDash([7, 5]);
+      ctx.lineDashOffset = -this.animTime * 20;
       ctx.stroke();
+      ctx.setLineDash([]);
+      ctx.lineDashOffset = 0;
     }
 
-    // Draw Towers
+    // 6. Towers
     for (const tower of this.towers) {
       this.drawTower(ctx, tower, selected?.id === tower.id);
     }
 
-    // Draw Monsters
+    // 7. Monsters
     for (const m of this.monsters) {
       this.drawMonster(ctx, m);
     }
 
-    // Draw Projectiles
-    for (const p of this.projectiles) {
-      ctx.save();
-      ctx.translate(p.x, p.y);
-      if (p.isArrow) {
-        const ang = Math.atan2(p.vy, p.vx);
-        ctx.rotate(ang);
-        ctx.fillStyle = p.isCrit ? '#fde047' : p.color;
-        ctx.fillRect(-7, -1.6, 14, 3.2);
-        ctx.beginPath();
-        ctx.moveTo(9, 0);
-        ctx.lineTo(4, -3.5);
-        ctx.lineTo(4, 3.5);
-        ctx.closePath();
-        ctx.fill();
-      } else {
-        ctx.beginPath();
-        ctx.arc(0, 0, p.radius, 0, Math.PI * 2);
-        ctx.fillStyle = p.color;
-        ctx.fill();
-        ctx.strokeStyle = '#ffffff';
-        ctx.lineWidth = 1;
-        ctx.stroke();
-      }
-      ctx.restore();
-    }
+    // 8. Projectiles (trails + crisp heads)
+    this.drawProjectiles(ctx);
 
-    // Draw Visual Effects
-    for (const e of this.effects) {
-      const t = Math.max(0, e.life / e.maxLife);
-      if (e.kind === 'ring') {
-        const rad = e.radius + (e.maxRadius - e.radius) * (1 - t);
-        ctx.beginPath();
-        ctx.arc(e.x, e.y, rad, 0, Math.PI * 2);
-        ctx.strokeStyle = e.color;
-        ctx.globalAlpha = t * 0.75;
-        ctx.lineWidth = 2.5;
-        ctx.stroke();
-        ctx.globalAlpha = 1;
-      } else if (e.kind === 'lightning' && e.points && e.points.length >= 2) {
-        ctx.beginPath();
-        ctx.moveTo(e.points[0].x, e.points[0].y);
-        for (let i = 1; i < e.points.length; i++) {
-          const prev = e.points[i - 1];
-          const curr = e.points[i];
-          const midX = (prev.x + curr.x) * 0.5 + (Math.random() - 0.5) * 14;
-          const midY = (prev.y + curr.y) * 0.5 + (Math.random() - 0.5) * 14;
-          ctx.lineTo(midX, midY);
-          ctx.lineTo(curr.x, curr.y);
-        }
-        ctx.strokeStyle = e.color;
-        ctx.globalAlpha = t;
-        ctx.lineWidth = e.radius + 1;
-        ctx.stroke();
-        ctx.strokeStyle = '#ffffff';
-        ctx.lineWidth = 1.2;
-        ctx.stroke();
-        ctx.globalAlpha = 1;
-      } else if (e.kind === 'text' && e.text) {
-        ctx.globalAlpha = t;
-        ctx.font = 'bold 13px sans-serif';
-        ctx.textAlign = 'center';
-        ctx.fillStyle = e.color;
-        ctx.fillText(e.text, e.x, e.y - (1 - t) * 18);
-        ctx.globalAlpha = 1;
-      }
-    }
+    // 9. Visual Effects (rings, lightning/lasers, sparks, floating popups)
+    this.drawEffects(ctx);
 
     ctx.restore();
   }
@@ -1139,173 +1500,469 @@ export class CastleTdEngine {
   private drawSpawnPortal(ctx: CanvasRenderingContext2D): void {
     const x = (SPAWN_TILE.col + 0.5) * TILE_SIZE;
     const y = (SPAWN_TILE.row + 0.5) * TILE_SIZE;
-    const pulse = 1 + Math.sin(this.animTime * 4) * 0.1;
+    const pulse = 1 + Math.sin(this.animTime * 4) * 0.09;
+
+    ctx.save();
+    ctx.translate(x, y);
+
+    // Obsidian altar ring
     ctx.beginPath();
-    ctx.arc(x, y, 22 * pulse, 0, Math.PI * 2);
-    ctx.fillStyle = 'rgba(168, 85, 247, 0.35)';
+    ctx.arc(0, 0, 24, 0, Math.PI * 2);
+    ctx.fillStyle = '#1e1b2e';
     ctx.fill();
-    ctx.beginPath();
-    ctx.arc(x, y, 14, 0, Math.PI * 2);
-    ctx.fillStyle = '#7e22ce';
-    ctx.fill();
-    ctx.strokeStyle = '#e9d5ff';
-    ctx.lineWidth = 2;
+    ctx.strokeStyle = '#4c1d95';
+    ctx.lineWidth = 2.5;
     ctx.stroke();
+
+    // Outer violet energy halo
+    const aura = ctx.createRadialGradient(0, 0, 4, 0, 0, 26 * pulse);
+    aura.addColorStop(0, 'rgba(216, 180, 254, 0.85)');
+    aura.addColorStop(0.55, 'rgba(147, 51, 234, 0.55)');
+    aura.addColorStop(1, 'rgba(88, 28, 135, 0)');
+    ctx.fillStyle = aura;
+    ctx.beginPath();
+    ctx.arc(0, 0, 26 * pulse, 0, Math.PI * 2);
+    ctx.fill();
+
+    // Rotating arcane rune ticks
+    ctx.save();
+    ctx.rotate(this.animTime * 1.8);
+    ctx.strokeStyle = '#e9d5ff';
+    ctx.lineWidth = 1.6;
+    for (let i = 0; i < 6; i++) {
+      const a = (i * Math.PI) / 3;
+      ctx.beginPath();
+      ctx.arc(0, 0, 17, a, a + 0.45);
+      ctx.stroke();
+    }
+    ctx.restore();
+
+    // Swirling core
+    ctx.beginPath();
+    ctx.arc(0, 0, 10, 0, Math.PI * 2);
+    ctx.fillStyle = '#581c87';
+    ctx.fill();
+    ctx.beginPath();
+    ctx.arc(0, 0, 4.5 * pulse, 0, Math.PI * 2);
+    ctx.fillStyle = '#f5d0fe';
+    ctx.fill();
+
+    ctx.restore();
   }
 
-  private drawCastle(ctx: CanvasRenderingContext2D): void {
+  private drawCastleMoatAndKeep(ctx: CanvasRenderingContext2D): void {
     const cx = (CASTLE_TILE.col + 0.5) * TILE_SIZE;
     const cy = (CASTLE_TILE.row + 0.5) * TILE_SIZE;
 
     ctx.save();
     ctx.translate(cx, cy);
 
-    // Glow
+    // Flowing shimmering moat channel wrapping around the castle keep
     ctx.beginPath();
-    ctx.arc(0, 0, 32, 0, Math.PI * 2);
-    ctx.fillStyle = this.castleHitFlash > 0 ? 'rgba(239,68,68,0.45)' : 'rgba(56,189,248,0.20)';
+    ctx.roundRect(-39, -29, 78, 56, 16);
+    ctx.fillStyle = '#0c4a6e';
+    ctx.fill();
+    ctx.strokeStyle = '#334155';
+    ctx.lineWidth = 2.5;
+    ctx.stroke();
+
+    // Shimmering animated water waves inside moat
+    const waterGrad = ctx.createLinearGradient(-35, -24, 35, 24);
+    waterGrad.addColorStop(0, '#0284c7');
+    waterGrad.addColorStop(0.5, '#0ea5e9');
+    waterGrad.addColorStop(1, '#0369a1');
+    ctx.beginPath();
+    ctx.roundRect(-36, -26, 72, 50, 14);
+    ctx.fillStyle = waterGrad;
     ctx.fill();
 
-    // Stone Keep
-    ctx.fillStyle = this.castleHitFlash > 0 ? '#ef4444' : '#cbd5e1';
+    ctx.strokeStyle = 'rgba(186, 230, 253, 0.55)';
+    ctx.lineWidth = 1.3;
+    for (let i = 0; i < 4; i++) {
+      const phase = this.animTime * 2.6 + i * 1.5;
+      const rx = Math.sin(phase) * 26;
+      const ry = -21 + (i % 2) * 40;
+      ctx.beginPath();
+      ctx.moveTo(rx - 6, ry);
+      ctx.quadraticCurveTo(rx, ry - 2, rx + 6, ry);
+      ctx.stroke();
+    }
+
+    // Wooden drawbridge spanning moat from north path (5,13) into castle gate
+    ctx.fillStyle = '#78350f';
+    ctx.fillRect(-10, -29, 20, 18);
+    ctx.strokeStyle = '#451a03';
+    ctx.lineWidth = 1;
+    for (let p = -27; p <= -13; p += 4) {
+      ctx.beginPath();
+      ctx.moveTo(-9, p);
+      ctx.lineTo(9, p);
+      ctx.stroke();
+    }
+
+    // Castle hit/fortify aura
+    ctx.beginPath();
+    ctx.arc(0, 0, 31, 0, Math.PI * 2);
+    ctx.fillStyle =
+      this.castleHitFlash > 0
+        ? 'rgba(239,68,68,0.48)'
+        : this.castleFortifyLevel > 0
+          ? 'rgba(56,189,248,0.26)'
+          : 'rgba(56,189,248,0.14)';
+    ctx.fill();
+
+    // Stone Keep shadow + main walls
+    ctx.fillStyle = 'rgba(0,0,0,0.45)';
+    ctx.fillRect(-24, -12, 48, 30);
+
+    ctx.fillStyle = this.castleHitFlash > 0 ? '#fca5a5' : '#cbd5e1';
     ctx.fillRect(-23, -15, 46, 30);
-    // Side battlements
-    ctx.fillStyle = '#94a3b8';
+    // Stone masonry lines
+    ctx.strokeStyle = 'rgba(51, 65, 85, 0.35)';
+    ctx.lineWidth = 1;
+    ctx.strokeRect(-23, -15, 46, 30);
+    ctx.beginPath();
+    ctx.moveTo(-23, -5);
+    ctx.lineTo(23, -5);
+    ctx.moveTo(-23, 5);
+    ctx.lineTo(23, 5);
+    ctx.stroke();
+
+    // Side towers (extra fortified stone trim when fortified)
+    ctx.fillStyle = this.castleFortifyLevel > 0 ? '#64748b' : '#94a3b8';
     ctx.fillRect(-26, -21, 13, 36);
     ctx.fillRect(13, -21, 13, 36);
-    // Pointed roofs
-    ctx.fillStyle = '#2563eb';
+    ctx.strokeStyle = '#334155';
+    ctx.strokeRect(-26, -21, 13, 36);
+    ctx.strokeRect(13, -21, 13, 36);
+
+    // Pointed royal roofs
+    ctx.fillStyle = '#1d4ed8';
     ctx.beginPath();
     ctx.moveTo(-28, -21);
-    ctx.lineTo(-19.5, -31);
+    ctx.lineTo(-19.5, -32);
     ctx.lineTo(-11, -21);
     ctx.closePath();
     ctx.fill();
     ctx.beginPath();
     ctx.moveTo(11, -21);
-    ctx.lineTo(19.5, -31);
+    ctx.lineTo(19.5, -32);
     ctx.lineTo(28, -21);
     ctx.closePath();
     ctx.fill();
-    // Gate
+
+    // Central arched gate
     ctx.fillStyle = '#451a03';
-    ctx.fillRect(-8, 1, 16, 14);
-    // Flag
+    ctx.beginPath();
+    ctx.roundRect(-8, 0, 16, 15, [6, 6, 0, 0]);
+    ctx.fill();
+    ctx.strokeStyle = '#92400e';
+    ctx.lineWidth = 1.2;
+    ctx.stroke();
+
+    // Animated flickering torches flanking castle gate
+    const flicker = 0.8 + Math.sin(this.animTime * 19) * 0.2;
+    for (const tx of [-12, 12]) {
+      const tg = ctx.createRadialGradient(tx, 3, 1, tx, 3, 10 * flicker);
+      tg.addColorStop(0, 'rgba(254, 240, 138, 0.95)');
+      tg.addColorStop(0.5, 'rgba(249, 115, 22, 0.55)');
+      tg.addColorStop(1, 'rgba(249, 115, 22, 0)');
+      ctx.fillStyle = tg;
+      ctx.beginPath();
+      ctx.arc(tx, 3, 10 * flicker, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.fillStyle = '#fef08a';
+      ctx.beginPath();
+      ctx.arc(tx, 3, 2.2 * flicker, 0, Math.PI * 2);
+      ctx.fill();
+    }
+
+    // Waving royal banner on central spire
+    const wave1 = Math.sin(this.animTime * 5.2) * 2.2;
+    const wave2 = Math.cos(this.animTime * 5.2) * 1.6;
+    ctx.fillStyle = '#e2e8f0';
+    ctx.fillRect(-1, -36, 2, 21);
     ctx.fillStyle = '#facc15';
-    ctx.fillRect(-1, -34, 2, 16);
-    ctx.fillRect(1, -34, 10, 6);
+    ctx.beginPath();
+    ctx.moveTo(1, -36);
+    ctx.quadraticCurveTo(6, -36 + wave1, 13, -34 + wave2);
+    ctx.lineTo(11, -29 + wave2);
+    ctx.quadraticCurveTo(6, -30 + wave1, 1, -29);
+    ctx.closePath();
+    ctx.fill();
 
     // Castle HP Bar
-    const ratio = Math.max(0, this.castleHp / this.castleMaxHp);
-    ctx.fillStyle = 'rgba(0,0,0,0.75)';
-    ctx.fillRect(-26, -42, 52, 7);
+    const ratio = Math.max(0, Math.min(1, this.castleHp / Math.max(1, this.castleMaxHp)));
+    ctx.fillStyle = 'rgba(2, 6, 23, 0.85)';
+    ctx.beginPath();
+    ctx.roundRect(-27, -45, 54, 8, 3);
+    ctx.fill();
     ctx.fillStyle = ratio > 0.5 ? '#22c55e' : ratio > 0.25 ? '#f59e0b' : '#ef4444';
-    ctx.fillRect(-25, -41, 50 * ratio, 5);
+    ctx.beginPath();
+    ctx.roundRect(-26, -44, 52 * ratio, 6, 2);
+    ctx.fill();
 
     ctx.restore();
   }
 
   private drawTower(ctx: CanvasRenderingContext2D, tower: TowerInstance, isSelected: boolean): void {
     const stats = this.getTowerStats(tower);
+    const tier = tower.baseUpgrades; // 0..10
     ctx.save();
     ctx.translate(tower.x, tower.y);
 
-    // Selection ring
+    // Selection glow ring
     if (isSelected) {
       ctx.beginPath();
-      ctx.arc(0, 0, 24, 0, Math.PI * 2);
+      ctx.arc(0, 0, 25 + Math.sin(this.animTime * 6) * 1.5, 0, Math.PI * 2);
       ctx.strokeStyle = '#38bdf8';
-      ctx.lineWidth = 2.5;
+      ctx.lineWidth = 2.6;
       ctx.stroke();
     }
 
-    // Plinth shadow + stone base
+    // Plinth drop shadow
     ctx.beginPath();
-    ctx.arc(0, 2, 20, 0, Math.PI * 2);
-    ctx.fillStyle = 'rgba(0,0,0,0.4)';
+    ctx.arc(0, 3, 21, 0, Math.PI * 2);
+    ctx.fillStyle = 'rgba(0, 0, 0, 0.45)';
     ctx.fill();
 
+    // Spec aura / max level glow
+    if (tower.specType || tier >= 10) {
+      const glowColor = tower.specType ? stats.color : '#facc15';
+      ctx.beginPath();
+      ctx.arc(0, 0, 23, 0, Math.PI * 2);
+      ctx.fillStyle = glowColor;
+      ctx.globalAlpha = 0.18 + Math.sin(this.animTime * 4 + tower.id) * 0.06;
+      ctx.fill();
+      ctx.globalAlpha = 1;
+    }
+
+    // Evolved base plinth (scales with level 0..10 and specialization)
+    const plinthRad = tower.specType ? 20.5 : 18 + Math.min(2, tier * 0.2);
     ctx.beginPath();
-    ctx.arc(0, 0, 19, 0, Math.PI * 2);
-    ctx.fillStyle = tower.specType ? '#1e293b' : '#334155';
+    ctx.arc(0, 0, plinthRad, 0, Math.PI * 2);
+    ctx.fillStyle = tower.specType ? '#0f172a' : tier >= 6 ? '#1e293b' : '#334155';
     ctx.fill();
 
-    // Rim color reflects progression (gray -> silver -> gold -> diamond spec!)
-    ctx.lineWidth = tower.specType ? 3.2 : 2.2;
+    // Rim evolution: rough stone -> iron rivets -> silver -> gold -> spec color
+    ctx.lineWidth = tower.specType ? 3.2 : tier >= 6 ? 2.8 : 2.1;
     ctx.strokeStyle = tower.specType
       ? tower.specUpgrades >= 10
         ? '#facc15'
         : stats.color
-      : tower.baseUpgrades >= 10
+      : tier >= 10
         ? '#facc15'
-        : tower.baseUpgrades >= 5
-          ? '#e2e8f0'
-          : '#64748b';
+        : tier >= 6
+          ? '#fbbf24'
+          : tier >= 3
+            ? '#cbd5e1'
+            : '#64748b';
     ctx.stroke();
 
-    // Chrono aura ring
-    if (tower.specType === 'chrono') {
-      ctx.beginPath();
-      ctx.arc(0, 0, 23 + Math.sin(this.animTime * 4) * 2, 0, Math.PI * 2);
-      ctx.strokeStyle = 'rgba(129, 140, 248, 0.45)';
-      ctx.lineWidth = 1.5;
-      ctx.stroke();
+    // Rivets / crenellation notches on level 3+ towers
+    if (tier >= 3 || tower.specType) {
+      const pipCount = tower.specType ? 4 + Math.floor(tower.specUpgrades / 3) : tier >= 7 ? 6 : 4;
+      ctx.fillStyle = tower.specType ? stats.accent : tier >= 7 ? '#fde047' : '#94a3b8';
+      for (let i = 0; i < pipCount; i++) {
+        const a = (i * Math.PI * 2) / pipCount + (tower.specType ? this.animTime * 0.7 : 0);
+        ctx.beginPath();
+        ctx.arc(Math.cos(a) * (plinthRad - 2.5), Math.sin(a) * (plinthRad - 2.5), 1.6, 0, Math.PI * 2);
+        ctx.fill();
+      }
     }
 
-    // Rotating turret body
+    // Chrono rotating clockwork ring
+    if (tower.specType === 'chrono') {
+      ctx.save();
+      ctx.rotate(this.animTime * 1.4);
+      ctx.strokeStyle = 'rgba(129, 140, 248, 0.7)';
+      ctx.lineWidth = 1.5;
+      ctx.setLineDash([4, 4]);
+      ctx.beginPath();
+      ctx.arc(0, 0, 23, 0, Math.PI * 2);
+      ctx.stroke();
+      ctx.setLineDash([]);
+      ctx.restore();
+    }
+
+    // Rotating turret body with recoil kick
     ctx.save();
     ctx.rotate(tower.angle);
+    const kick = -tower.recoil * 3.2;
+    ctx.translate(kick, 0);
+
     if (tower.baseType === 'archer') {
-      ctx.fillStyle = stats.color;
-      ctx.fillRect(-6, -8, 12, 16);
-      ctx.strokeStyle = stats.accent;
-      ctx.lineWidth = 2.5;
+      // Crossbow / Ballista turret evolving across levels & specs
+      ctx.fillStyle = tower.specType === 'venom' ? '#365314' : '#451a03';
       ctx.beginPath();
-      ctx.arc(3, 0, 10, -Math.PI * 0.45, Math.PI * 0.45);
+      ctx.roundRect(-7, -7, 14, 14, 3);
+      ctx.fill();
+
+      // Bow arms (wider/double at higher levels or multishot)
+      ctx.strokeStyle = stats.color;
+      ctx.lineWidth = tier >= 5 || tower.specType ? 3 : 2.3;
+      ctx.beginPath();
+      ctx.arc(2, 0, 11, -Math.PI * 0.46, Math.PI * 0.46);
       ctx.stroke();
-      ctx.fillStyle = '#fde047';
-      ctx.fillRect(0, -1.5, 13, 3);
+
+      if (tower.specType === 'multishot' || tier >= 7) {
+        ctx.strokeStyle = stats.accent;
+        ctx.lineWidth = 1.6;
+        ctx.beginPath();
+        ctx.arc(5, 0, 12.5, -Math.PI * 0.36, Math.PI * 0.36);
+        ctx.stroke();
+      }
+
+      // Rail / Scope
+      ctx.fillStyle = tower.specType === 'sniper' ? '#fde047' : stats.accent;
+      ctx.fillRect(-1, -1.5, tower.specType === 'sniper' ? 20 : 14, 3);
+
+      if (tower.specType === 'sniper') {
+        // Sniper laser glint
+        ctx.fillStyle = '#ef4444';
+        ctx.beginPath();
+        ctx.arc(6, -4, 2.2, 0, Math.PI * 2);
+        ctx.fill();
+      } else if (tower.specType === 'venom') {
+        // Venom emerald vial
+        ctx.fillStyle = '#a3e635';
+        ctx.beginPath();
+        ctx.arc(-2, 0, 4, 0, Math.PI * 2);
+        ctx.fill();
+      }
     } else if (tower.baseType === 'cannon') {
-      ctx.fillStyle = '#475569';
-      ctx.fillRect(-9, -9, 16, 18);
-      ctx.fillStyle = stats.color;
-      ctx.fillRect(2, tower.specType === 'gatling' ? -6 : -4.5, 16, tower.specType === 'gatling' ? 12 : 9);
+      // Heavy iron carriage
+      ctx.fillStyle = '#334155';
+      ctx.beginPath();
+      ctx.roundRect(-10, -10, 18, 20, 4);
+      ctx.fill();
+
+      if (tower.specType === 'gatling') {
+        // Triple gatling barrels
+        ctx.fillStyle = '#94a3b8';
+        ctx.fillRect(3, -6, 15, 3);
+        ctx.fillRect(3, -1.5, 16, 3);
+        ctx.fillRect(3, 3, 15, 3);
+        ctx.fillStyle = stats.color;
+        ctx.fillRect(8, -6.5, 4, 13);
+      } else if (tower.specType === 'mortar') {
+        // Flared wide siege bore
+        ctx.fillStyle = '#1e293b';
+        ctx.beginPath();
+        ctx.moveTo(0, -6);
+        ctx.lineTo(17, -9);
+        ctx.lineTo(17, 9);
+        ctx.lineTo(0, 6);
+        ctx.closePath();
+        ctx.fill();
+        ctx.strokeStyle = stats.color;
+        ctx.lineWidth = 2;
+        ctx.stroke();
+      } else if (tower.specType === 'inferno') {
+        // Magma furnace barrel
+        ctx.fillStyle = '#7c2d12';
+        ctx.fillRect(1, -6, 15, 12);
+        ctx.fillStyle = '#fbbf24';
+        ctx.beginPath();
+        ctx.arc(4, 0, 5 + Math.sin(this.animTime * 12) * 0.8, 0, Math.PI * 2);
+        ctx.fill();
+      } else {
+        // Standard evolving cannon barrel
+        const barrelLen = 15 + Math.floor(tier / 4) * 2;
+        ctx.fillStyle = stats.color;
+        ctx.fillRect(2, -4.5, barrelLen, 9);
+        ctx.fillStyle = '#e2e8f0';
+        ctx.fillRect(barrelLen - 1, -5.5, 3, 11);
+      }
+
       if (tower.muzzleFlash > 0) {
         ctx.beginPath();
-        ctx.arc(20, 0, 6 * tower.muzzleFlash, 0, Math.PI * 2);
-        ctx.fillStyle = '#fef08a';
+        ctx.arc(19, 0, 7.5 * tower.muzzleFlash, 0, Math.PI * 2);
+        ctx.fillStyle = tower.specType === 'inferno' ? '#fb923c' : '#fef08a';
         ctx.fill();
       }
     } else if (tower.baseType === 'frost') {
+      // Rotating hexagonal crystal spire
+      ctx.save();
+      ctx.rotate(-tower.angle + this.animTime * (tower.specType ? 1.5 : 0.8));
+      const pts = tower.specType === 'blizzard' ? 8 : 6;
+      const rad = 11 + Math.min(3, tier * 0.25);
       ctx.fillStyle = stats.color;
       ctx.beginPath();
-      for (let k = 0; k < 6; k++) {
-        const a = (k * Math.PI) / 3;
-        const px = Math.cos(a) * 11;
-        const py = Math.sin(a) * 11;
+      for (let k = 0; k < pts; k++) {
+        const a = (k * Math.PI * 2) / pts;
+        const r = k % 2 === 0 ? rad : rad * 0.72;
+        const px = Math.cos(a) * r;
+        const py = Math.sin(a) * r;
         if (k === 0) ctx.moveTo(px, py);
         else ctx.lineTo(px, py);
       }
       ctx.closePath();
       ctx.fill();
+      ctx.strokeStyle = stats.accent;
+      ctx.lineWidth = 1.4;
+      ctx.stroke();
+      ctx.restore();
+
+      if (tower.specType === 'cryo') {
+        // Twin cryo emitter prongs
+        ctx.fillStyle = '#cffafe';
+        ctx.fillRect(4, -5.5, 11, 2.5);
+        ctx.fillRect(4, 3, 11, 2.5);
+      }
+
       ctx.fillStyle = '#ffffff';
       ctx.beginPath();
-      ctx.arc(0, 0, 4.5, 0, Math.PI * 2);
+      ctx.arc(0, 0, 4.2, 0, Math.PI * 2);
       ctx.fill();
     } else {
+      // Lightning / Chain / Laser / Tesla coils
+      ctx.fillStyle = '#1e1b4b';
+      ctx.beginPath();
+      ctx.arc(0, 0, 11, 0, Math.PI * 2);
+      ctx.fill();
+
       ctx.fillStyle = stats.color;
       ctx.beginPath();
-      ctx.arc(0, 0, 10, 0, Math.PI * 2);
+      ctx.arc(0, 0, 8.5, 0, Math.PI * 2);
       ctx.fill();
-      ctx.fillStyle = stats.accent;
-      ctx.fillRect(4, -3, 12, 6);
+
+      if (tower.specType === 'laser') {
+        // Focusing ruby prism barrel
+        ctx.fillStyle = '#fbcfe8';
+        ctx.fillRect(3, -3.5, 14, 7);
+        ctx.fillStyle = '#f43f5e';
+        ctx.beginPath();
+        ctx.arc(16, 0, 3.2, 0, Math.PI * 2);
+        ctx.fill();
+      } else if (tower.specType === 'chain' || tower.specType === 'tesla') {
+        // Twin/triple storm prongs
+        ctx.fillStyle = stats.accent;
+        ctx.fillRect(4, -6, 11, 2.5);
+        ctx.fillRect(4, 3.5, 11, 2.5);
+        ctx.beginPath();
+        ctx.arc(15, -4.7, 2.3, 0, Math.PI * 2);
+        ctx.arc(15, 4.7, 2.3, 0, Math.PI * 2);
+        ctx.fill();
+      } else {
+        ctx.fillStyle = stats.accent;
+        ctx.fillRect(4, -3, 11, 6);
+      }
+
+      // Core orb pulse
+      ctx.fillStyle = '#ffffff';
+      ctx.beginPath();
+      ctx.arc(0, 0, 3.2 + Math.sin(this.animTime * 10) * 0.7, 0, Math.PI * 2);
+      ctx.fill();
     }
     ctx.restore();
 
-    // Compact level tag
+    // Compact level badge
     const lvlLabel = tower.specType ? `S${tower.specUpgrades}` : `${tower.baseUpgrades}`;
-    ctx.fillStyle = 'rgba(15, 23, 42, 0.88)';
-    ctx.fillRect(-12, 11, 24, 12);
+    ctx.fillStyle = 'rgba(15, 23, 42, 0.9)';
+    ctx.beginPath();
+    ctx.roundRect(-12, 11, 24, 12, 4);
+    ctx.fill();
     ctx.font = 'bold 9px sans-serif';
     ctx.textAlign = 'center';
     ctx.fillStyle = tower.specType ? '#facc15' : tower.baseUpgrades >= 10 ? '#4ade80' : '#f8fafc';
@@ -1315,32 +1972,111 @@ export class CastleTdEngine {
   }
 
   private drawMonster(ctx: CanvasRenderingContext2D, m: MonsterInstance): void {
-    const bob = Math.sin(this.animTime * 9 + m.wobbleOffset) * 1.6;
+    const bob = Math.sin(this.animTime * 9 + m.wobbleOffset) * (m.kind === 'runner' ? 2.8 : 1.6);
     ctx.save();
-    ctx.translate(m.x, m.y + bob);
+    ctx.translate(m.x, m.y);
 
-    // Shadow
+    // Ground shadow (stays on ground while body bobs)
     ctx.beginPath();
-    ctx.ellipse(0, m.radius * 0.7, m.radius * 0.9, m.radius * 0.45, 0, 0, Math.PI * 2);
-    ctx.fillStyle = 'rgba(0,0,0,0.35)';
+    ctx.ellipse(0, m.radius * 0.85, m.radius * 0.92, m.radius * 0.42, 0, 0, Math.PI * 2);
+    ctx.fillStyle = 'rgba(0, 0, 0, 0.38)';
     ctx.fill();
+
+    ctx.translate(0, bob);
+
+    // Boss menacing aura
+    if (m.kind === 'boss') {
+      ctx.beginPath();
+      ctx.arc(0, 0, m.radius + 5 + Math.sin(this.animTime * 6) * 1.5, 0, Math.PI * 2);
+      ctx.fillStyle = 'rgba(192, 38, 211, 0.25)';
+      ctx.fill();
+    }
+
+    // Winged runner (flapping bat/imp wings!)
+    if (m.kind === 'runner') {
+      const flap = Math.sin(this.animTime * 22 + m.wobbleOffset) * 5;
+      ctx.fillStyle = 'rgba(253, 224, 71, 0.78)';
+      ctx.beginPath();
+      ctx.moveTo(-4, 0);
+      ctx.lineTo(-m.radius - 8, -7 + flap);
+      ctx.lineTo(-m.radius - 4, 3 + flap * 0.4);
+      ctx.closePath();
+      ctx.fill();
+      ctx.beginPath();
+      ctx.moveTo(4, 0);
+      ctx.lineTo(m.radius + 8, -7 + flap);
+      ctx.lineTo(m.radius + 4, 3 + flap * 0.4);
+      ctx.closePath();
+      ctx.fill();
+    }
 
     // Body color (status tinted)
     let fill = m.color;
     if (m.hitFlash > 0.2) fill = '#ffffff';
     else if (m.freezeTimer > 0) fill = '#67e8f9';
     else if (m.slowTimer > 0) fill = '#38bdf8';
+    else if (m.burnTimer > 0) fill = '#fb923c';
     else if (m.poisonTimer > 0) fill = '#84cc16';
 
     ctx.beginPath();
-    ctx.arc(0, 0, m.radius, 0, Math.PI * 2);
+    if (m.kind === 'golem') {
+      // Craggy octagonal golem silhouette
+      for (let i = 0; i < 8; i++) {
+        const a = (i * Math.PI) / 4;
+        const r = m.radius * (i % 2 === 0 ? 1.06 : 0.9);
+        const px = Math.cos(a) * r;
+        const py = Math.sin(a) * r;
+        if (i === 0) ctx.moveTo(px, py);
+        else ctx.lineTo(px, py);
+      }
+      ctx.closePath();
+    } else {
+      ctx.arc(0, 0, m.radius, 0, Math.PI * 2);
+    }
     ctx.fillStyle = fill;
     ctx.fill();
-    ctx.strokeStyle = m.kind === 'boss' ? '#facc15' : '#0f172a';
-    ctx.lineWidth = m.kind === 'boss' ? 2.5 : 1.4;
+    ctx.strokeStyle = m.kind === 'boss' ? '#facc15' : m.kind === 'knight' ? '#e2e8f0' : '#0f172a';
+    ctx.lineWidth = m.kind === 'boss' ? 2.6 : 1.5;
     ctx.stroke();
 
-    // Horns / crown for orc/knight/boss
+    // Slime glossy highlight
+    if (m.kind === 'slime' && m.hitFlash <= 0.2) {
+      ctx.fillStyle = 'rgba(255, 255, 255, 0.45)';
+      ctx.beginPath();
+      ctx.ellipse(-m.radius * 0.3, -m.radius * 0.35, m.radius * 0.28, m.radius * 0.16, -0.5, 0, Math.PI * 2);
+      ctx.fill();
+    }
+
+    // Goblin ears
+    if (m.kind === 'goblin') {
+      ctx.fillStyle = fill;
+      ctx.beginPath();
+      ctx.moveTo(-m.radius * 0.8, -2);
+      ctx.lineTo(-m.radius * 1.4, -6);
+      ctx.lineTo(-m.radius * 0.7, 3);
+      ctx.fill();
+      ctx.beginPath();
+      ctx.moveTo(m.radius * 0.8, -2);
+      ctx.lineTo(m.radius * 1.4, -6);
+      ctx.lineTo(m.radius * 0.7, 3);
+      ctx.fill();
+    }
+
+    // Knight armored shield & helm crest
+    if (m.kind === 'knight') {
+      ctx.fillStyle = '#475569';
+      ctx.beginPath();
+      ctx.roundRect(-m.radius * 0.95, -2, m.radius * 0.65, m.radius * 1.05, 3);
+      ctx.fill();
+      ctx.strokeStyle = '#f8fafc';
+      ctx.lineWidth = 1.2;
+      ctx.stroke();
+      // Plume
+      ctx.fillStyle = '#ef4444';
+      ctx.fillRect(-3, -m.radius - 4, 6, 5);
+    }
+
+    // Horns / crown for orc / golem / boss
     if (m.kind === 'orc' || m.kind === 'golem' || m.kind === 'boss') {
       ctx.fillStyle = m.kind === 'boss' ? '#facc15' : '#fef3c7';
       ctx.beginPath();
@@ -1355,22 +2091,132 @@ export class CastleTdEngine {
       ctx.fill();
     }
 
-    // Angry eyes
-    ctx.fillStyle = '#0f172a';
-    ctx.fillRect(-m.radius * 0.4, -2, 3, 3);
-    ctx.fillRect(m.radius * 0.15, -2, 3, 3);
+    // Glowing eyes
+    ctx.fillStyle = m.kind === 'boss' ? '#fef08a' : m.kind === 'golem' ? '#fde047' : '#0f172a';
+    ctx.fillRect(-m.radius * 0.42, -2.5, 3.2, 3.2);
+    ctx.fillRect(m.radius * 0.14, -2.5, 3.2, 3.2);
+
+    // Frozen crystal encasement
+    if (m.freezeTimer > 0) {
+      ctx.strokeStyle = '#e0f2fe';
+      ctx.fillStyle = 'rgba(165, 243, 252, 0.32)';
+      ctx.lineWidth = 1.5;
+      ctx.beginPath();
+      ctx.roundRect(-m.radius - 2, -m.radius - 2, m.radius * 2 + 4, m.radius * 2 + 4, 5);
+      ctx.fill();
+      ctx.stroke();
+    }
 
     // HP bar if damaged or boss
     if (m.hp < m.maxHp || m.kind === 'boss') {
       const bw = Math.max(18, m.radius * 2);
-      const ratio = Math.max(0, m.hp / m.maxHp);
-      ctx.fillStyle = 'rgba(0,0,0,0.75)';
-      ctx.fillRect(-bw * 0.5, -m.radius - 7, bw, 4);
+      const ratio = Math.max(0, Math.min(1, m.hp / Math.max(1, m.maxHp)));
+      ctx.fillStyle = 'rgba(0,0,0,0.8)';
+      ctx.fillRect(-bw * 0.5, -m.radius - 8, bw, 4.5);
       ctx.fillStyle = m.kind === 'boss' ? '#f43f5e' : '#22c55e';
-      ctx.fillRect(-bw * 0.5, -m.radius - 7, bw * ratio, 4);
+      ctx.fillRect(-bw * 0.5, -m.radius - 8, bw * ratio, 4.5);
     }
 
     ctx.restore();
+  }
+
+  private drawProjectiles(ctx: CanvasRenderingContext2D): void {
+    for (const p of this.projectiles) {
+      // Glowing trail
+      ctx.strokeStyle = p.isCrit ? '#fde047' : p.color;
+      ctx.globalAlpha = 0.42;
+      ctx.lineWidth = p.isArrow ? 2 : p.radius * 1.1;
+      ctx.beginPath();
+      ctx.moveTo(p.prevX, p.prevY);
+      ctx.lineTo(p.x, p.y);
+      ctx.stroke();
+      ctx.globalAlpha = 1;
+
+      ctx.save();
+      ctx.translate(p.x, p.y);
+      if (p.isArrow) {
+        const ang = Math.atan2(p.vy, p.vx);
+        ctx.rotate(ang);
+        ctx.fillStyle = p.isCrit ? '#fde047' : p.color;
+        ctx.fillRect(-8, -1.6, 15, 3.2);
+        ctx.beginPath();
+        ctx.moveTo(10, 0);
+        ctx.lineTo(4, -3.6);
+        ctx.lineTo(4, 3.6);
+        ctx.closePath();
+        ctx.fill();
+      } else {
+        // Outer glow halo
+        ctx.beginPath();
+        ctx.arc(0, 0, p.radius * 1.6, 0, Math.PI * 2);
+        ctx.fillStyle = p.color;
+        ctx.globalAlpha = 0.28;
+        ctx.fill();
+        ctx.globalAlpha = 1;
+
+        ctx.beginPath();
+        ctx.arc(0, 0, p.radius, 0, Math.PI * 2);
+        ctx.fillStyle = p.color;
+        ctx.fill();
+        ctx.strokeStyle = '#ffffff';
+        ctx.lineWidth = 1.1;
+        ctx.stroke();
+      }
+      ctx.restore();
+    }
+  }
+
+  private drawEffects(ctx: CanvasRenderingContext2D): void {
+    for (const e of this.effects) {
+      const t = Math.max(0, Math.min(1, e.life / Math.max(0.001, e.maxLife)));
+      if (e.kind === 'ring') {
+        const rad = e.radius + (e.maxRadius - e.radius) * (1 - t);
+        ctx.beginPath();
+        ctx.arc(e.x, e.y, rad, 0, Math.PI * 2);
+        ctx.strokeStyle = e.color;
+        ctx.globalAlpha = t * 0.8;
+        ctx.lineWidth = 2.6;
+        ctx.stroke();
+        ctx.globalAlpha = 1;
+      } else if (e.kind === 'spark') {
+        ctx.globalAlpha = t;
+        ctx.fillStyle = e.color;
+        ctx.beginPath();
+        ctx.arc(e.x, e.y, e.radius * (0.4 + t * 0.6), 0, Math.PI * 2);
+        ctx.fill();
+        ctx.globalAlpha = 1;
+      } else if (e.kind === 'lightning' && e.points && e.points.length >= 2) {
+        ctx.beginPath();
+        ctx.moveTo(e.points[0].x, e.points[0].y);
+        for (let i = 1; i < e.points.length; i++) {
+          const prev = e.points[i - 1];
+          const curr = e.points[i];
+          const midX = (prev.x + curr.x) * 0.5 + (Math.random() - 0.5) * 14;
+          const midY = (prev.y + curr.y) * 0.5 + (Math.random() - 0.5) * 14;
+          ctx.lineTo(midX, midY);
+          ctx.lineTo(curr.x, curr.y);
+        }
+        ctx.strokeStyle = e.color;
+        ctx.globalAlpha = t;
+        ctx.lineWidth = e.radius + 2.2;
+        ctx.stroke();
+        ctx.strokeStyle = '#ffffff';
+        ctx.lineWidth = 1.4;
+        ctx.stroke();
+        ctx.globalAlpha = 1;
+      } else if (e.kind === 'text' && e.text) {
+        const py = e.y - (1 - t) * 18;
+        ctx.globalAlpha = t;
+        ctx.font = e.bold ? '900 14px sans-serif' : 'bold 12px sans-serif';
+        ctx.textAlign = 'center';
+        ctx.lineWidth = 3;
+        ctx.strokeStyle = 'rgba(2, 6, 23, 0.85)';
+        ctx.strokeText(e.text, e.x, py);
+        ctx.fillStyle = e.color;
+        ctx.fillText(e.text, e.x, py);
+        ctx.globalAlpha = 1;
+      }
+    }
   }
 
   private pushHud(force: boolean): void {

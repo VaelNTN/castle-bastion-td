@@ -67,10 +67,23 @@ export interface LocalBest {
   bestScore: number;
 }
 
+function safeInt(val: unknown): number {
+  return typeof val === 'number' && Number.isFinite(val) && val > 0 ? Math.floor(val) : 0;
+}
+
 export function getLocalBest(): LocalBest {
   try {
     const raw = localStorage.getItem(KEY_LOCAL_BEST);
-    if (raw) return JSON.parse(raw) as LocalBest;
+    if (raw) {
+      const parsed = JSON.parse(raw) as Partial<LocalBest> | null;
+      if (parsed && typeof parsed === 'object') {
+        return {
+          bestWave: safeInt(parsed.bestWave),
+          bestKills: safeInt(parsed.bestKills),
+          bestScore: safeInt(parsed.bestScore),
+        };
+      }
+    }
   } catch {
     // ignore
   }
@@ -80,9 +93,9 @@ export function getLocalBest(): LocalBest {
 export function updateLocalBest(wave: number, kills: number, score: number): LocalBest {
   const prev = getLocalBest();
   const next: LocalBest = {
-    bestWave: Math.max(prev.bestWave, wave),
-    bestKills: Math.max(prev.bestKills, kills),
-    bestScore: Math.max(prev.bestScore, score),
+    bestWave: Math.max(prev.bestWave, safeInt(wave)),
+    bestKills: Math.max(prev.bestKills, safeInt(kills)),
+    bestScore: Math.max(prev.bestScore, safeInt(score)),
   };
   try {
     localStorage.setItem(KEY_LOCAL_BEST, JSON.stringify(next));

@@ -51,3 +51,17 @@ export const WORLD_WAYPOINTS: { x: number; y: number }[] = PATH_WAYPOINTS.map((p
 export function isPathTile(col: number, row: number): boolean {
   return PATH_TILE_SET.has(`${col},${row}`);
 }
+
+export function getPathNeighbors(col: number, row: number): {
+  top: boolean;
+  right: boolean;
+  bottom: boolean;
+  left: boolean;
+} {
+  return {
+    top: isPathTile(col, row - 1),
+    right: isPathTile(col + 1, row),
+    bottom: isPathTile(col, row + 1),
+    left: isPathTile(col - 1, row),
+  };
+}

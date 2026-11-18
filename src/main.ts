@@ -63,6 +63,17 @@ class CastleBastionApp {
     canvas.addEventListener('click', (e) => {
       this.engine?.handleCanvasTap(e.clientX, e.clientY);
     });
+    canvas.addEventListener('pointermove', (e) => {
+      if (e.pointerType === 'mouse' || e.pointerType === 'pen') {
+        this.engine?.handleCanvasHover(e.clientX, e.clientY);
+      }
+    });
+    canvas.addEventListener('pointerleave', () => {
+      this.engine?.clearHover();
+    });
+    canvas.addEventListener('pointercancel', () => {
+      this.engine?.clearHover();
+    });
 
     topbar.addEventListener('click', (e) => {
       const btn = (e.target as HTMLElement | null)?.closest<HTMLButtonElement>('button');
@@ -135,6 +146,7 @@ class CastleBastionApp {
   }
 
   private initEngine(): void {
+    this.engine?.destroy();
     const canvas = this.root.querySelector<HTMLCanvasElement>('#td-canvas')!;
     this.engine = new CastleTdEngine(
       canvas,
