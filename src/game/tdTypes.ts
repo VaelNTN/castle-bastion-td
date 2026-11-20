@@ -112,6 +112,8 @@ export interface ProjectileInstance {
   vx: number;
   vy: number;
   targetId: number;
+  targetX: number;
+  targetY: number;
   speed: number;
   damage: number;
   color: string;

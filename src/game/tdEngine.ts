@@ -49,9 +49,12 @@ export interface TdUiSnapshot {
   pendingSpawns: number;
   speedMult: 1 | 2 | 4;
   autoWave: boolean;
+  started: boolean;
+  paused: boolean;
   gameOver: boolean;
   buildTool: BaseTowerType | null;
   selectedTower: TowerInstance | null;
+  previewTile: { col: number; row: number } | null;
   nextWaveCostBonus: number;
 }
 
@@ -78,6 +81,7 @@ export class CastleTdEngine {
   private castleMaxHp = 100;
   private castleFortifyLevel = 0;
   private castleHitFlash = 0;
+  private screenShake = 0;
 
   private wave = 0;
   private kills = 0;
@@ -87,11 +91,14 @@ export class CastleTdEngine {
   private speedMult: 1 | 2 | 4 = 1;
   private autoWave = true;
   private autoWaveCountdown = 2.5;
+  private started = false;
+  private paused = false;
   private gameOver = false;
 
   private buildTool: BaseTowerType | null = 'archer';
   private selectedTowerId: number | null = null;
   private hoverTile: { col: number; row: number } | null = null;
+  private previewTile: { col: number; row: number } | null = null;
 
   private rafId = 0;
   private running = false;
@@ -193,7 +200,7 @@ export class CastleTdEngine {
     soundFx.clearPending();
   }
 
-  resetGame(): void {
+  resetGame(autoStart = true): void {
     this.towers = [];
     this.monsters = [];
     this.projectiles = [];
@@ -205,19 +212,46 @@ export class CastleTdEngine {
     this.castleMaxHp = 100;
     this.castleFortifyLevel = 0;
     this.castleHitFlash = 0;
+    this.screenShake = 0;
     this.wave = 0;
     this.kills = 0;
     this.score = 0;
-    this.autoWaveCountdown = 2.0;
+    this.autoWaveCountdown = 2.5;
+    this.started = autoStart;
+    this.paused = false;
     this.gameOver = false;
     this.selectedTowerId = null;
     this.buildTool = 'archer';
     this.hoverTile = null;
+    this.previewTile = null;
     this.pushHud(true);
+  }
+
+  startDefense(): void {
+    if (this.started) return;
+    this.started = true;
+    this.paused = false;
+    this.autoWaveCountdown = 2.5;
+    this.lastTs = performance.now();
+    this.pushHud(true);
+  }
+
+  setPaused(paused: boolean): void {
+    if (this.paused === paused) return;
+    this.paused = paused;
+    if (!paused) {
+      this.lastTs = performance.now();
+    }
+    this.pushHud(true);
+  }
+
+  isPaused(): boolean {
+    return this.paused;
   }
 
   setBuildTool(tool: BaseTowerType | null): void {
     this.buildTool = tool;
+    this.previewTile = null;
     if (tool !== null) this.selectedTowerId = null;
     this.pushHud(true);
   }
@@ -234,6 +268,7 @@ export class CastleTdEngine {
 
   selectTower(id: number | null): void {
     this.selectedTowerId = id;
+    this.previewTile = null;
     if (id !== null) this.buildTool = null;
     this.pushHud(true);
   }
@@ -347,27 +382,74 @@ export class CastleTdEngine {
     this.hoverTile = null;
   }
 
-  handleCanvasTap(clientX: number, clientY: number): void {
-    if (this.gameOver) return;
+  handleTouchPreview(clientX: number, clientY: number): void {
+    if (!this.started || this.paused || this.gameOver || !this.buildTool) return;
+    const tile = this.screenToTile(clientX, clientY);
+    if (!tile || isPathTile(tile.col, tile.row)) {
+      this.previewTile = null;
+      return;
+    }
+    const existing = this.towers.find((t) => t.col === tile.col && t.row === tile.row);
+    if (existing) {
+      this.previewTile = null;
+      return;
+    }
+    this.previewTile = tile;
+  }
+
+  clearPreview(): void {
+    if (this.previewTile !== null) {
+      this.previewTile = null;
+      this.pushHud(true);
+    }
+  }
+
+  confirmPreviewBuild(): void {
+    if (!this.previewTile || !this.buildTool || this.gameOver || !this.started) return;
+    this.placeTowerAt(this.previewTile.col, this.previewTile.row);
+  }
+
+  handleCanvasTap(clientX: number, clientY: number, isTouch = false): void {
+    if (!this.started || this.paused || this.gameOver) return;
     const tile = this.screenToTile(clientX, clientY);
     if (!tile) return;
     const { col, row } = tile;
 
     const existing = this.towers.find((t) => t.col === col && t.row === row);
     if (existing) {
+      this.previewTile = null;
       this.selectedTowerId = existing.id;
       this.pushHud(true);
       return;
     }
 
     if (isPathTile(col, row) || !this.buildTool) {
+      this.previewTile = null;
       this.selectedTowerId = null;
       this.pushHud(true);
       return;
     }
 
+    // On touch devices, first tap previews range & placement; second tap on the same tile confirms build!
+    if (isTouch) {
+      if (!this.previewTile || this.previewTile.col !== col || this.previewTile.row !== row) {
+        this.selectedTowerId = null;
+        this.previewTile = { col, row };
+        this.pushHud(true);
+        return;
+      }
+    }
+
+    this.placeTowerAt(col, row);
+  }
+
+  private placeTowerAt(col: number, row: number): void {
+    if (!this.buildTool || isPathTile(col, row)) return;
+    if (this.towers.some((t) => t.col === col && t.row === row)) return;
+
     const def = BASE_TOWERS[this.buildTool];
     if (this.gold < def.cost) {
+      this.previewTile = null;
       this.pushEffect({
         kind: 'text',
         x: (col + 0.5) * TILE_SIZE,
@@ -380,10 +462,12 @@ export class CastleTdEngine {
         life: 0.9,
         maxLife: 0.9,
       });
+      this.pushHud(true);
       return;
     }
 
     this.gold -= def.cost;
+    this.previewTile = null;
     const tower: TowerInstance = {
       id: this.nextEntityId++,
       col,
@@ -563,7 +647,7 @@ export class CastleTdEngine {
   }
 
   sendNextWaveEarly(): void {
-    if (this.gameOver) return;
+    if (!this.started || this.paused || this.gameOver) return;
     if (this.spawnQueue.length > 600) {
       this.pushEffect({
         kind: 'text',
@@ -723,9 +807,17 @@ export class CastleTdEngine {
   }
 
   private update(rawDt: number): void {
+    if (!this.started) {
+      // Gentle ambient animation on title overlay without launching waves
+      this.animTime += rawDt;
+      return;
+    }
+    if (this.paused) return;
+
     const dt = rawDt * this.speedMult;
     this.animTime += dt;
     if (this.castleHitFlash > 0) this.castleHitFlash = Math.max(0, this.castleHitFlash - rawDt * 2.5);
+    if (this.screenShake > 0) this.screenShake = Math.max(0, this.screenShake - rawDt * 3.4);
 
     if (this.gameOver) return;
 
@@ -806,6 +898,7 @@ export class CastleTdEngine {
         // Reached castle!
         this.castleHp = Math.max(0, this.castleHp - m.castleDmg);
         this.castleHitFlash = 1;
+        this.screenShake = Math.min(1, this.screenShake + 0.45 + Math.min(0.45, m.castleDmg * 0.025));
         soundFx.castleHit();
         this.pushEffect({
           kind: 'text',
@@ -1000,6 +1093,8 @@ export class CastleTdEngine {
             vx: (dx / dist) * speed,
             vy: (dy / dist) * speed,
             targetId: tgt.id,
+            targetX: tgt.x,
+            targetY: tgt.y,
             speed,
             damage: isCrit ? Math.round(stats.damage * 2.1) : stats.damage,
             color: stats.color,
@@ -1031,24 +1126,30 @@ export class CastleTdEngine {
       p.prevX = p.x;
       p.prevY = p.y;
 
-      const tgt = this.monsters.find((m) => m.id === p.targetId);
+      const tgt = this.monsters.find((m) => m.id === p.targetId && m.hp > 0) ?? null;
       if (tgt) {
-        const dx = tgt.x - p.x;
-        const dy = tgt.y - p.y;
-        const d = Math.hypot(dx, dy);
-        if (!Number.isFinite(d)) {
-          this.projectiles.splice(i, 1);
-          continue;
-        }
-        if (d <= p.speed * dt + tgt.radius + 4) {
-          this.detonateProjectile(p, tgt);
-          this.projectiles.splice(i, 1);
-          continue;
-        }
-        if (d > 0.001) {
-          p.vx = (dx / d) * p.speed;
-          p.vy = (dy / d) * p.speed;
-        }
+        p.targetX = tgt.x;
+        p.targetY = tgt.y;
+      }
+
+      const dx = p.targetX - p.x;
+      const dy = p.targetY - p.y;
+      const d = Math.hypot(dx, dy);
+      if (!Number.isFinite(d)) {
+        this.projectiles.splice(i, 1);
+        continue;
+      }
+
+      const hitThreshold = p.speed * dt + (tgt ? tgt.radius + 4 : 6);
+      if (d <= hitThreshold) {
+        this.detonateProjectile(p, tgt, p.targetX, p.targetY);
+        this.projectiles.splice(i, 1);
+        continue;
+      }
+
+      if (d > 0.001) {
+        p.vx = (dx / d) * p.speed;
+        p.vy = (dy / d) * p.speed;
       }
 
       p.x += p.vx * dt;
@@ -1083,7 +1184,12 @@ export class CastleTdEngine {
     }
   }
 
-  private detonateProjectile(p: ProjectileInstance, directTarget: MonsterInstance): void {
+  private detonateProjectile(
+    p: ProjectileInstance,
+    directTarget: MonsterInstance | null,
+    impactX: number,
+    impactY: number
+  ): void {
     const owner = this.towers.find((t) => t.id === p.towerId) ?? null;
 
     if (p.splashRadius > 0) {
@@ -1092,8 +1198,8 @@ export class CastleTdEngine {
       }
       this.pushEffect({
         kind: 'ring',
-        x: directTarget.x,
-        y: directTarget.y,
+        x: impactX,
+        y: impactY,
         radius: 6,
         maxRadius: p.splashRadius,
         color: p.color,
@@ -1101,15 +1207,16 @@ export class CastleTdEngine {
         maxLife: 0.26,
       });
       this.spawnSparks(
-        directTarget.x,
-        directTarget.y,
+        impactX,
+        impactY,
         p.kind === 'cryo' ? '#a5f3fc' : p.kind === 'venom' ? '#bef264' : '#fde047',
         p.kind === 'mortar' ? 10 : 6,
         p.kind === 'mortar' ? 140 : 95
       );
 
       for (const m of this.monsters) {
-        const d = Math.hypot(m.x - directTarget.x, m.y - directTarget.y);
+        if (m.hp <= 0) continue;
+        const d = Math.hypot(m.x - impactX, m.y - impactY);
         if (d <= p.splashRadius + m.radius) {
           const falloff = d <= p.splashRadius * 0.4 ? 1 : 0.72;
           this.applyDamage(m, Math.round(p.damage * falloff), owner, false);
@@ -1130,7 +1237,7 @@ export class CastleTdEngine {
           }
         }
       }
-    } else {
+    } else if (directTarget) {
       this.applyDamage(directTarget, p.damage, owner, p.isCrit);
       if (p.slowAmount > 0) {
         directTarget.slowAmount = Math.max(directTarget.slowAmount, p.slowAmount);
@@ -1150,6 +1257,9 @@ export class CastleTdEngine {
       if (p.isCrit) {
         this.spawnSparks(directTarget.x, directTarget.y, '#fde047', 6, 115);
       }
+    } else {
+      // Orphaned single-target projectile reached last known spot
+      this.spawnSparks(impactX, impactY, p.color, 3, 65);
     }
   }
 
@@ -1362,15 +1472,15 @@ export class CastleTdEngine {
       }
     }
 
-    // Castle stone courtyard apron around CASTLE_TILE
+    // Castle stone courtyard apron strictly inside CASTLE_TILE (5,14)
     const cx = (CASTLE_TILE.col + 0.5) * TILE_SIZE;
     const cy = (CASTLE_TILE.row + 0.5) * TILE_SIZE;
-    const apronGrad = g.createRadialGradient(cx, cy, 10, cx, cy, TILE_SIZE * 1.15);
+    const apronGrad = g.createRadialGradient(cx, cy, 6, cx, cy, TILE_SIZE * 0.5);
     apronGrad.addColorStop(0, 'rgba(30, 58, 138, 0.45)');
     apronGrad.addColorStop(1, 'rgba(15, 23, 42, 0)');
     g.fillStyle = apronGrad;
     g.beginPath();
-    g.arc(cx, cy, TILE_SIZE * 1.15, 0, Math.PI * 2);
+    g.arc(cx, cy, TILE_SIZE * 0.5, 0, Math.PI * 2);
     g.fill();
 
     this.terrainCache = c;
@@ -1386,15 +1496,19 @@ export class CastleTdEngine {
     ctx.fillStyle = '#070f1d';
     ctx.fillRect(0, 0, this.cssW, this.cssH);
 
+    const shakeMag = this.screenShake > 0 ? this.screenShake * this.screenShake * 7 : 0;
+    const shakeX = shakeMag > 0 ? (Math.random() - 0.5) * 2 * shakeMag : 0;
+    const shakeY = shakeMag > 0 ? (Math.random() - 0.5) * 2 * shakeMag : 0;
+
     ctx.save();
-    ctx.translate(this.offsetX, this.offsetY);
+    ctx.translate(this.offsetX + shakeX, this.offsetY + shakeY);
     ctx.scale(this.scale, this.scale);
 
     // 1. Static cached battlefield terrain
     ctx.drawImage(this.getTerrainCache(), 0, 0);
 
-    // 2. Buildable tile grid cues & hover preview
-    if (this.buildTool) {
+    // 2. Buildable tile grid cues & touch/hover range preview
+    if (this.buildTool && this.started) {
       ctx.lineWidth = 1.2;
       const pulse = 0.14 + Math.sin(this.animTime * 4) * 0.05;
       ctx.strokeStyle = `rgba(134, 239, 172, ${pulse.toFixed(3)})`;
@@ -1408,21 +1522,61 @@ export class CastleTdEngine {
         }
       }
 
-      if (this.hoverTile && !isPathTile(this.hoverTile.col, this.hoverTile.row)) {
-        const occ = this.towers.some((t) => t.col === this.hoverTile!.col && t.row === this.hoverTile!.row);
+      const activePreview = this.previewTile ?? this.hoverTile;
+      if (activePreview && !isPathTile(activePreview.col, activePreview.row)) {
+        const occ = this.towers.some((t) => t.col === activePreview.col && t.row === activePreview.row);
         if (!occ) {
           const def = BASE_TOWERS[this.buildTool];
-          const hx = (this.hoverTile.col + 0.5) * TILE_SIZE;
-          const hy = (this.hoverTile.row + 0.5) * TILE_SIZE;
+          const hx = (activePreview.col + 0.5) * TILE_SIZE;
+          const hy = (activePreview.row + 0.5) * TILE_SIZE;
           const rangePx = def.range * TILE_SIZE;
+          const canAfford = this.gold >= def.cost;
+
+          // Range circle fill + dashed border
           ctx.beginPath();
           ctx.arc(hx, hy, rangePx, 0, Math.PI * 2);
-          ctx.fillStyle = this.gold >= def.cost ? 'rgba(74, 222, 128, 0.10)' : 'rgba(248, 113, 113, 0.10)';
+          ctx.fillStyle = canAfford ? 'rgba(74, 222, 128, 0.12)' : 'rgba(248, 113, 113, 0.12)';
           ctx.fill();
-          ctx.strokeStyle = this.gold >= def.cost ? 'rgba(74, 222, 128, 0.55)' : 'rgba(248, 113, 113, 0.55)';
-          ctx.setLineDash([5, 5]);
+          ctx.strokeStyle = canAfford ? 'rgba(74, 222, 128, 0.72)' : 'rgba(248, 113, 113, 0.72)';
+          ctx.lineWidth = 2;
+          ctx.setLineDash([6, 5]);
+          ctx.lineDashOffset = -this.animTime * 18;
           ctx.stroke();
           ctx.setLineDash([]);
+          ctx.lineDashOffset = 0;
+
+          // Highlight tile + translucent tower ghost
+          ctx.fillStyle = canAfford ? 'rgba(74, 222, 128, 0.16)' : 'rgba(248, 113, 113, 0.16)';
+          ctx.fillRect(activePreview.col * TILE_SIZE + 2, activePreview.row * TILE_SIZE + 2, TILE_SIZE - 4, TILE_SIZE - 4);
+          ctx.beginPath();
+          ctx.arc(hx, hy, 17, 0, Math.PI * 2);
+          ctx.fillStyle = def.color;
+          ctx.globalAlpha = 0.55;
+          ctx.fill();
+          ctx.globalAlpha = 1;
+          ctx.strokeStyle = canAfford ? '#4ade80' : '#f87171';
+          ctx.lineWidth = 2;
+          ctx.stroke();
+
+          // Tap-to-confirm hint badge when using touch preview
+          if (this.previewTile) {
+            const label = canAfford ? `Tap again • ${def.cost}g` : `Need ${def.cost}g`;
+            ctx.font = '800 10px system-ui, sans-serif';
+            const tw = ctx.measureText(label).width + 12;
+            const by = Math.max(14, hy - 34);
+            ctx.fillStyle = 'rgba(2, 6, 23, 0.9)';
+            ctx.beginPath();
+            ctx.roundRect(hx - tw * 0.5, by - 9, tw, 18, 9);
+            ctx.fill();
+            ctx.strokeStyle = canAfford ? '#4ade80' : '#f87171';
+            ctx.lineWidth = 1.2;
+            ctx.stroke();
+            ctx.fillStyle = canAfford ? '#bbf7d0' : '#fecaca';
+            ctx.textAlign = 'center';
+            ctx.textBaseline = 'middle';
+            ctx.fillText(label, hx, by);
+            ctx.textBaseline = 'alphabetic';
+          }
         }
       }
     }
@@ -1557,52 +1711,52 @@ export class CastleTdEngine {
     ctx.save();
     ctx.translate(cx, cy);
 
-    // Flowing shimmering moat channel wrapping around the castle keep
+    // Flowing shimmering moat channel contained cleanly within tile (5,14) [-27..+27]
     ctx.beginPath();
-    ctx.roundRect(-39, -29, 78, 56, 16);
+    ctx.roundRect(-27, -27, 54, 54, 11);
     ctx.fillStyle = '#0c4a6e';
     ctx.fill();
     ctx.strokeStyle = '#334155';
-    ctx.lineWidth = 2.5;
+    ctx.lineWidth = 2;
     ctx.stroke();
 
     // Shimmering animated water waves inside moat
-    const waterGrad = ctx.createLinearGradient(-35, -24, 35, 24);
+    const waterGrad = ctx.createLinearGradient(-25, -25, 25, 25);
     waterGrad.addColorStop(0, '#0284c7');
     waterGrad.addColorStop(0.5, '#0ea5e9');
     waterGrad.addColorStop(1, '#0369a1');
     ctx.beginPath();
-    ctx.roundRect(-36, -26, 72, 50, 14);
+    ctx.roundRect(-25, -25, 50, 50, 9);
     ctx.fillStyle = waterGrad;
     ctx.fill();
 
     ctx.strokeStyle = 'rgba(186, 230, 253, 0.55)';
-    ctx.lineWidth = 1.3;
+    ctx.lineWidth = 1.2;
     for (let i = 0; i < 4; i++) {
       const phase = this.animTime * 2.6 + i * 1.5;
-      const rx = Math.sin(phase) * 26;
-      const ry = -21 + (i % 2) * 40;
+      const rx = Math.sin(phase) * 15;
+      const ry = -20 + (i % 2) * 40;
       ctx.beginPath();
-      ctx.moveTo(rx - 6, ry);
-      ctx.quadraticCurveTo(rx, ry - 2, rx + 6, ry);
+      ctx.moveTo(rx - 5, ry);
+      ctx.quadraticCurveTo(rx, ry - 1.8, rx + 5, ry);
       ctx.stroke();
     }
 
-    // Wooden drawbridge spanning moat from north path (5,13) into castle gate
+    // Wooden drawbridge spanning north moat from path (5,13) into castle gate
     ctx.fillStyle = '#78350f';
-    ctx.fillRect(-10, -29, 20, 18);
+    ctx.fillRect(-8, -27, 16, 15);
     ctx.strokeStyle = '#451a03';
     ctx.lineWidth = 1;
-    for (let p = -27; p <= -13; p += 4) {
+    for (let p = -25; p <= -14; p += 3.5) {
       ctx.beginPath();
-      ctx.moveTo(-9, p);
-      ctx.lineTo(9, p);
+      ctx.moveTo(-7, p);
+      ctx.lineTo(7, p);
       ctx.stroke();
     }
 
-    // Castle hit/fortify aura
+    // Castle hit/fortify aura (kept inside tile bounds)
     ctx.beginPath();
-    ctx.arc(0, 0, 31, 0, Math.PI * 2);
+    ctx.arc(0, 0, 23, 0, Math.PI * 2);
     ctx.fillStyle =
       this.castleHitFlash > 0
         ? 'rgba(239,68,68,0.48)'
@@ -1612,94 +1766,94 @@ export class CastleTdEngine {
     ctx.fill();
 
     // Stone Keep shadow + main walls
-    ctx.fillStyle = 'rgba(0,0,0,0.45)';
-    ctx.fillRect(-24, -12, 48, 30);
+    ctx.fillStyle = 'rgba(0,0,0,0.42)';
+    ctx.fillRect(-18, -9, 36, 25);
 
     ctx.fillStyle = this.castleHitFlash > 0 ? '#fca5a5' : '#cbd5e1';
-    ctx.fillRect(-23, -15, 46, 30);
+    ctx.fillRect(-17, -12, 34, 24);
     // Stone masonry lines
     ctx.strokeStyle = 'rgba(51, 65, 85, 0.35)';
     ctx.lineWidth = 1;
-    ctx.strokeRect(-23, -15, 46, 30);
+    ctx.strokeRect(-17, -12, 34, 24);
     ctx.beginPath();
-    ctx.moveTo(-23, -5);
-    ctx.lineTo(23, -5);
-    ctx.moveTo(-23, 5);
-    ctx.lineTo(23, 5);
+    ctx.moveTo(-17, -4);
+    ctx.lineTo(17, -4);
+    ctx.moveTo(-17, 4);
+    ctx.lineTo(17, 4);
     ctx.stroke();
 
     // Side towers (extra fortified stone trim when fortified)
     ctx.fillStyle = this.castleFortifyLevel > 0 ? '#64748b' : '#94a3b8';
-    ctx.fillRect(-26, -21, 13, 36);
-    ctx.fillRect(13, -21, 13, 36);
+    ctx.fillRect(-20, -17, 10, 29);
+    ctx.fillRect(10, -17, 10, 29);
     ctx.strokeStyle = '#334155';
-    ctx.strokeRect(-26, -21, 13, 36);
-    ctx.strokeRect(13, -21, 13, 36);
+    ctx.strokeRect(-20, -17, 10, 29);
+    ctx.strokeRect(10, -17, 10, 29);
 
     // Pointed royal roofs
     ctx.fillStyle = '#1d4ed8';
     ctx.beginPath();
-    ctx.moveTo(-28, -21);
-    ctx.lineTo(-19.5, -32);
-    ctx.lineTo(-11, -21);
+    ctx.moveTo(-22, -17);
+    ctx.lineTo(-15, -26);
+    ctx.lineTo(-8, -17);
     ctx.closePath();
     ctx.fill();
     ctx.beginPath();
-    ctx.moveTo(11, -21);
-    ctx.lineTo(19.5, -32);
-    ctx.lineTo(28, -21);
+    ctx.moveTo(8, -17);
+    ctx.lineTo(15, -26);
+    ctx.lineTo(22, -17);
     ctx.closePath();
     ctx.fill();
 
     // Central arched gate
     ctx.fillStyle = '#451a03';
     ctx.beginPath();
-    ctx.roundRect(-8, 0, 16, 15, [6, 6, 0, 0]);
+    ctx.roundRect(-6, 1, 12, 11, [5, 5, 0, 0]);
     ctx.fill();
     ctx.strokeStyle = '#92400e';
-    ctx.lineWidth = 1.2;
+    ctx.lineWidth = 1.1;
     ctx.stroke();
 
     // Animated flickering torches flanking castle gate
     const flicker = 0.8 + Math.sin(this.animTime * 19) * 0.2;
-    for (const tx of [-12, 12]) {
-      const tg = ctx.createRadialGradient(tx, 3, 1, tx, 3, 10 * flicker);
+    for (const tx of [-9.5, 9.5]) {
+      const tg = ctx.createRadialGradient(tx, 3, 1, tx, 3, 8 * flicker);
       tg.addColorStop(0, 'rgba(254, 240, 138, 0.95)');
       tg.addColorStop(0.5, 'rgba(249, 115, 22, 0.55)');
       tg.addColorStop(1, 'rgba(249, 115, 22, 0)');
       ctx.fillStyle = tg;
       ctx.beginPath();
-      ctx.arc(tx, 3, 10 * flicker, 0, Math.PI * 2);
+      ctx.arc(tx, 3, 8 * flicker, 0, Math.PI * 2);
       ctx.fill();
       ctx.fillStyle = '#fef08a';
       ctx.beginPath();
-      ctx.arc(tx, 3, 2.2 * flicker, 0, Math.PI * 2);
+      ctx.arc(tx, 3, 1.8 * flicker, 0, Math.PI * 2);
       ctx.fill();
     }
 
     // Waving royal banner on central spire
-    const wave1 = Math.sin(this.animTime * 5.2) * 2.2;
-    const wave2 = Math.cos(this.animTime * 5.2) * 1.6;
+    const wave1 = Math.sin(this.animTime * 5.2) * 1.8;
+    const wave2 = Math.cos(this.animTime * 5.2) * 1.4;
     ctx.fillStyle = '#e2e8f0';
-    ctx.fillRect(-1, -36, 2, 21);
+    ctx.fillRect(-1, -28, 2, 16);
     ctx.fillStyle = '#facc15';
     ctx.beginPath();
-    ctx.moveTo(1, -36);
-    ctx.quadraticCurveTo(6, -36 + wave1, 13, -34 + wave2);
-    ctx.lineTo(11, -29 + wave2);
-    ctx.quadraticCurveTo(6, -30 + wave1, 1, -29);
+    ctx.moveTo(1, -28);
+    ctx.quadraticCurveTo(5, -28 + wave1, 11, -26.5 + wave2);
+    ctx.lineTo(9.5, -22.5 + wave2);
+    ctx.quadraticCurveTo(5, -23.5 + wave1, 1, -22.5);
     ctx.closePath();
     ctx.fill();
 
-    // Castle HP Bar
+    // Castle HP Bar (centered neatly above castle keep)
     const ratio = Math.max(0, Math.min(1, this.castleHp / Math.max(1, this.castleMaxHp)));
-    ctx.fillStyle = 'rgba(2, 6, 23, 0.85)';
+    ctx.fillStyle = 'rgba(2, 6, 23, 0.88)';
     ctx.beginPath();
-    ctx.roundRect(-27, -45, 54, 8, 3);
+    ctx.roundRect(-24, -37, 48, 7, 3);
     ctx.fill();
     ctx.fillStyle = ratio > 0.5 ? '#22c55e' : ratio > 0.25 ? '#f59e0b' : '#ef4444';
     ctx.beginPath();
-    ctx.roundRect(-26, -44, 52 * ratio, 6, 2);
+    ctx.roundRect(-23, -36, 46 * ratio, 5, 2);
     ctx.fill();
 
     ctx.restore();
@@ -2337,9 +2491,12 @@ export class CastleTdEngine {
       pendingSpawns: this.spawnQueue.length,
       speedMult: this.speedMult,
       autoWave: this.autoWave,
+      started: this.started,
+      paused: this.paused,
       gameOver: this.gameOver,
       buildTool: this.buildTool,
       selectedTower: this.getSelectedTower(),
+      previewTile: this.previewTile,
       nextWaveCostBonus: this.spawnQueue.length > 0 || this.monsters.length > 0 ? 35 + this.wave * 6 : 0,
     });
   }
